@@ -1,0 +1,393 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Layout, option, and event types for the grpc-ebcdic collector.
+//
+// An EBCDIC data file carries no self-describing structure: it is a run of
+// fixed-width records whose fields only mean something together with the
+// COBOL copybook that produced them. Everything in this file exists to carry
+// that copybook onto the wire alongside the bytes, and to carry the decoded
+// records back as typed cells rather than as pre-rendered text.
+//
+// The layout model mirrors Docling's `EbcdicLayout` / `EbcdicRecordLayout` /
+// `EbcdicField` one for one, so a caller that already has a Docling layout can
+// send it either as this message or as the equivalent JSON.
+
+syntax = "proto3";
+
+package ai.pipestream.ebcdic.v1;
+
+option java_multiple_files = true;
+option java_outer_classname = "EbcdicProto";
+option java_package = "ai.pipestream.ebcdic.v1";
+
+// FieldType is how the bytes of one fixed-width field are decoded.
+//
+// The names map to the COBOL usages found in a copybook, and to Docling's
+// `EbcdicFieldType` values of the same name.
+enum FieldType {
+  // Not set. Treated as FIELD_TYPE_STRING, which is Docling's default for a
+  // field that declares no type.
+  FIELD_TYPE_UNSPECIFIED = 0;
+
+  // `USAGE DISPLAY` character data, `PIC X(n)` / `PIC A(n)`. Decoded with the
+  // request's EBCDIC code page.
+  FIELD_TYPE_STRING = 1;
+
+  // Signed big-endian two's-complement binary, `COMP` / `COMP-4` / `BINARY`
+  // over a `PIC S9(n)` picture.
+  FIELD_TYPE_INTEGER = 2;
+
+  // Unsigned big-endian binary, `COMP` / `COMP-4` / `BINARY` over a
+  // `PIC 9(n)` picture.
+  FIELD_TYPE_UNSIGNED_INTEGER = 3;
+
+  // `COMP-3` / `PACKED-DECIMAL`: two decimal digits per byte, sign in the
+  // trailing nibble.
+  FIELD_TYPE_PACKED_DECIMAL = 4;
+
+  // Signed `USAGE DISPLAY` numeric: one digit in the low nibble of every
+  // byte, sign overpunched into the zone nibble of the last byte.
+  FIELD_TYPE_ZONED_DECIMAL = 5;
+
+  // Filler. The bytes are consumed to keep the record aligned and no cell is
+  // emitted for them.
+  FIELD_TYPE_SKIP = 6;
+}
+
+// EbcdicField is a single fixed-width field of an EBCDIC record.
+//
+// Mirrors Docling's `EbcdicField`. Fields are listed in physical record order
+// and their offsets are implied by the running sum of the preceding sizes;
+// `offset` is an optional cross-check, not a second way to place a field.
+message EbcdicField {
+  // Column name of the decoded field. Used as the cell name and as the table
+  // header when a client assembles rows into a table.
+  string name = 1;
+
+  // Field width in bytes. Must be greater than zero.
+  uint32 size = 2;
+
+  // How the bytes are decoded.
+  FieldType type = 3;
+
+  // Number of implied decimal digits of a numeric field, i.e. the digits
+  // after `V` in the COBOL picture clause. Zero for integers and text.
+  uint32 scale = 4;
+
+  // Original COBOL picture clause, for diagnostics only. Never used to
+  // decode; `size`, `type`, and `scale` are the contract.
+  string picture = 5;
+
+  // Byte offset of this field inside the record, cross-checked against the
+  // running sum of the preceding field sizes. Leave unset to place the field
+  // immediately after its predecessor. A value ahead of the running offset
+  // declares a gap of unread bytes; a value behind it means the fields
+  // overlap and the request is rejected with INVALID_ARGUMENT.
+  optional uint32 offset = 6;
+}
+
+// EbcdicRecordLayout is the field layout of one record schema, i.e. a single
+// COBOL copybook. Mirrors Docling's `EbcdicRecordLayout`.
+message EbcdicRecordLayout {
+  // Fields in physical record order. At least one is required.
+  repeated EbcdicField fields = 1;
+
+  // Name of the schema. Reported on every row decoded with it and used as the
+  // table heading downstream. Defaults to `record` when empty.
+  string name = 2;
+
+  // Value of the record-type prefix that selects this schema, compared
+  // against the decoded and stringified value of
+  // `EbcdicLayout.record_type_field`. Required as soon as a layout defines
+  // more than one schema.
+  optional string selector = 3;
+}
+
+// EbcdicLayout is the complete set of parsing rules for an EBCDIC data file.
+//
+// It describes the bytes to ignore at the file boundaries, the optional prefix
+// carried by every record, and the record schemas themselves. Records are
+// fixed-length unless `record_length_field` declares a length prefix. Mirrors
+// Docling's `EbcdicLayout`.
+message EbcdicLayout {
+  // Record schemas present in the file. At least one is required.
+  repeated EbcdicRecordLayout records = 1;
+
+  // Free-text description of the layout, echoed back in LayoutInfo.
+  string description = 2;
+
+  // Bytes to skip at the start of the file before the first record.
+  uint32 header_size = 3;
+
+  // Bytes to skip at the end of the file after the last record. The server
+  // holds this many bytes back from decoding until the input ends, so it is
+  // capped well below the byte cap.
+  uint32 footer_size = 4;
+
+  // Prefix field holding the total record length, prefix included. Set it for
+  // variable-length records; leave it unset when every record has the fixed
+  // size of its schema.
+  optional EbcdicField record_length_field = 5;
+
+  // Prefix field whose decoded value selects the record schema. Required for
+  // multi-schema files. Read after `record_length_field` when both are set.
+  optional EbcdicField record_type_field = 6;
+}
+
+// ParseOptions carries everything the server needs before it sees a byte of
+// data. It must be the payload of the first ParseEbcdicRequest frame.
+message ParseOptions {
+  // Name of the EBCDIC code page used to decode character data, for example
+  // `cp037` (US/Canada), `cp500` (international) or `cp1140` (euro). Empty
+  // means `cp037`. An unknown name is INVALID_ARGUMENT; a known family the
+  // server was not built with is UNIMPLEMENTED.
+  string encoding = 1;
+
+  // The layout, in one of three mutually exclusive forms. Sending none of
+  // them, or more than one, is INVALID_ARGUMENT: the bytes are meaningless
+  // without a layout and the server refuses to guess one.
+  oneof layout_source {
+    // Parsing rules as a protobuf message. The canonical form.
+    EbcdicLayout layout = 2;
+
+    // Parsing rules as the JSON serialization of Docling's `EbcdicLayout`
+    // pydantic model, exactly as `EbcdicBackendOptions.layout_file` would
+    // hold it. Parsed in process; never a path on the server.
+    bytes layout_json = 3;
+
+    // COBOL copybook source text, compiled in process into a single-schema
+    // layout. Supports the flat `PIC` subset described in the README;
+    // anything outside it (REDEFINES, OCCURS DEPENDING ON, COMP-1/COMP-2,
+    // numeric-edited pictures) is UNIMPLEMENTED, and source that is not a
+    // copybook at all is INVALID_ARGUMENT.
+    string copybook = 4;
+  }
+
+  // Stop after this many records. Zero reads every record in the input.
+  uint64 max_records = 5;
+
+  // Drop Unicode control characters from decoded character data. Unset means
+  // true, matching Docling's `strip_control_characters` default.
+  optional bool strip_control_characters = 6;
+
+  // Reject the whole stream instead of warning about recoverable anomalies:
+  // a trailing partial record, or trailing bytes that are not a whole record.
+  // Field-level corruption is always fatal regardless of this flag, because a
+  // packed field with a bad nibble has no value to report.
+  bool abort_on_error = 7;
+
+  // Upper bound on the input, in mebibytes. Zero means the server default.
+  // Exceeding it fails the stream with RESOURCE_EXHAUSTED.
+  uint32 max_document_mib = 8;
+}
+
+// Decimal is an exact base-10 number: `unscaled * 10^-scale`.
+//
+// COBOL numerics are decimal by construction and a binary float cannot hold
+// them, so nothing here is ever an IEEE double.
+message Decimal {
+  // Canonical rendering with the scale applied, for example `-123.45`. Always
+  // set and always exact; the one field a client can rely on unconditionally.
+  string text = 1;
+
+  // Number of implied fractional digits, i.e. the digits after `V` in the
+  // picture clause.
+  uint32 scale = 2;
+
+  // The value with the decimal point removed. Absent when the number needs
+  // more than the 18 digits that fit an int64, in which case `text` is the
+  // only exact form.
+  optional sint64 unscaled = 3;
+}
+
+// Cell is one decoded field of one record.
+message Cell {
+  // Name of the field this cell was decoded from, as given in the layout.
+  string name = 1;
+
+  // Type the field was decoded as, so a client can tell an integer cell that
+  // came from COMP-3 from one that came from binary COMP.
+  FieldType type = 2;
+
+  // The decoded value. Exactly one is set: character fields are `text`,
+  // numeric fields with a scale are `decimal`, and numeric fields without one
+  // are `integer` unless they need more than 64 bits, in which case they are
+  // `decimal` with a zero scale.
+  oneof value {
+    // Character data, decoded with the configured code page, control
+    // characters dropped when the option is on, then trimmed at both ends.
+    string text = 3;
+
+    // A scaled decimal, or an integer too wide for `integer`.
+    Decimal decimal = 4;
+
+    // An unscaled whole number that fits in 64 bits.
+    int64 integer = 5;
+  }
+}
+
+// FieldSchema is one field of a record schema as the server resolved it,
+// including the byte offset it computed.
+message FieldSchema {
+  // Column name of the decoded field.
+  string name = 1;
+
+  // Resolved byte offset of the field inside the record body.
+  uint32 offset = 2;
+
+  // Field width in bytes.
+  uint32 size = 3;
+
+  // How the bytes are decoded.
+  FieldType type = 4;
+
+  // Number of implied decimal digits.
+  uint32 scale = 5;
+
+  // Original COBOL picture clause when the layout carried one, otherwise
+  // empty.
+  string picture = 6;
+}
+
+// RecordSchema is one record layout as the server resolved it.
+message RecordSchema {
+  // Name of the schema, as reported on every RecordRow decoded with it.
+  string name = 1;
+
+  // Total body length in bytes, the record prefix excluded. Zero when the
+  // schema is only ever used with a length prefix that overrides it.
+  uint32 record_length = 2;
+
+  // Fields in physical order, `FIELD_TYPE_SKIP` fillers included. Cells are
+  // emitted for every field except the fillers, in this order.
+  repeated FieldSchema fields = 3;
+
+  // Value of the record-type prefix that selects this schema, when the layout
+  // has more than one.
+  optional string selector = 4;
+}
+
+// LayoutInfo is the first event of every successful parse, sent before any
+// input byte is consumed so a client can paint the table header immediately.
+message LayoutInfo {
+  // Canonical name of the code page character data is decoded with, for
+  // example `cp037`.
+  string encoding = 1;
+
+  // Record schemas, in layout order.
+  repeated RecordSchema records = 2;
+
+  // Free-text description carried by the layout, if any.
+  string description = 3;
+
+  // Bytes skipped at the start of the input.
+  uint32 header_size = 4;
+
+  // Bytes held back and skipped at the end of the input.
+  uint32 footer_size = 5;
+
+  // Length of the prefix read ahead of every record, zero when the layout
+  // declares neither a length nor a type field.
+  uint32 prefix_size = 6;
+
+  // Where the layout came from, so a caller can see how a copybook compiled.
+  LayoutSource source = 7;
+}
+
+// LayoutSource records which of the three layout forms a request used.
+enum LayoutSource {
+  // Not set. Never emitted by the server.
+  LAYOUT_SOURCE_UNSPECIFIED = 0;
+
+  // `ParseOptions.layout`, a protobuf message.
+  LAYOUT_SOURCE_PROTO = 1;
+
+  // `ParseOptions.layout_json`, Docling's JSON shape.
+  LAYOUT_SOURCE_JSON = 2;
+
+  // `ParseOptions.copybook`, compiled from COBOL source.
+  LAYOUT_SOURCE_COPYBOOK = 3;
+}
+
+// RecordRow is one decoded record, emitted the moment its last byte arrives.
+//
+// Rows are never batched and never held back: this event is the product, and
+// a client that merges rows as they land sees the dump fill in while the
+// upload is still in flight.
+message RecordRow {
+  // Name of the record schema this row was decoded with.
+  string record_type = 1;
+
+  // Zero-based index of this row among the rows of its own schema.
+  uint64 row_index = 2;
+
+  // Zero-based index of this record among all records kept from the input,
+  // across schemas. Matches the order rows are emitted in.
+  uint64 record_index = 3;
+
+  // Byte offset of the record's prefix within the input, counted from the
+  // first byte the client sent.
+  uint64 byte_offset = 4;
+
+  // Decoded cells in field order, `FIELD_TYPE_SKIP` fillers omitted.
+  repeated Cell cells = 5;
+}
+
+// WarningCode names a recoverable anomaly the parse survived.
+enum WarningCode {
+  // Not set. Never emitted by the server.
+  WARNING_CODE_UNSPECIFIED = 0;
+
+  // The input ended inside a record: its bytes are not a whole multiple of
+  // the record length. The partial record is dropped. With
+  // `abort_on_error` this is INVALID_ARGUMENT instead.
+  WARNING_CODE_TRAILING_PARTIAL_RECORD = 1;
+
+  // `max_records` was reached and the rest of the input was not decoded.
+  WARNING_CODE_MAX_RECORDS_REACHED = 2;
+
+  // The input was shorter than `header_size` plus `footer_size`, so no record
+  // could be read at all.
+  WARNING_CODE_INPUT_SHORTER_THAN_BOUNDARIES = 3;
+}
+
+// ParseWarning is one recoverable anomaly, reported in the trailer.
+message ParseWarning {
+  // Which anomaly this is.
+  WarningCode code = 1;
+
+  // Human-readable detail, never the sole carrier of meaning.
+  string message = 2;
+
+  // Byte offset in the input the anomaly was noticed at.
+  uint64 byte_offset = 3;
+}
+
+// ParseStatus is the trailer of a successful parse: counts and warnings, sent
+// once after the last RecordRow. It is not the payload, and a client that
+// waits for it before showing anything has misused the stream.
+message ParseStatus {
+  // Number of records decoded and emitted as RecordRow events.
+  uint64 records_kept = 1;
+
+  // Total bytes of input the server received, boundaries included.
+  uint64 bytes_received = 2;
+
+  // Bytes actually walked as record data, i.e. `bytes_received` less the
+  // header, the footer, and any trailing partial record.
+  uint64 bytes_consumed = 3;
+
+  // Bytes left over after the last whole record and before the footer. Zero
+  // when the input divided evenly.
+  uint64 trailing_bytes = 4;
+
+  // Whether `max_records` cut the parse short.
+  bool truncated = 5;
+
+  // Recoverable anomalies, in the order they were noticed.
+  repeated ParseWarning warnings = 6;
+
+  // Rows decoded per schema, keyed by schema name. Present for every schema
+  // in the layout, including those that matched nothing.
+  map<string, uint64> rows_per_record_type = 7;
+}

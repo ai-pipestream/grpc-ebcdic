@@ -1,0 +1,114 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// gRPC service contract for the grpc-ebcdic collector.
+//
+// The service takes copybook-driven EBCDIC records and streams one typed
+// event per decoded record as the byte walk progresses. It is deliberately
+// not a convert-then-return RPC: a mainframe dump is routinely tens of
+// gigabytes, and both the server's memory and the caller's first paint depend
+// on rows leaving as they are decoded rather than after the upload finishes.
+
+syntax = "proto3";
+
+package ai.pipestream.ebcdic.v1;
+
+import "ai/pipestream/ebcdic/v1/ebcdic.proto";
+
+option java_multiple_files = true;
+option java_outer_classname = "EbcdicServiceProto";
+option java_package = "ai.pipestream.ebcdic.v1";
+
+// EbcdicParseService decodes fixed-width EBCDIC records against a
+// caller-supplied copybook and streams the rows back as they are decoded.
+service EbcdicParseService {
+  // Decodes an EBCDIC byte stream into typed record rows.
+  //
+  // Bidirectional streaming. The first request frame must carry `options`,
+  // including exactly one layout form; every later frame carries a `chunk` of
+  // the file bytes, in order. The server answers with `layout_info` before it
+  // reads a single data byte, then one `record` event per decoded record as
+  // soon as that record's last byte has arrived, then a single `status`
+  // trailer once the request stream ends.
+  //
+  // Rows are not batched and not reordered. A caller that sends the first
+  // record and then holds the stream open receives that row without sending
+  // anything further; that property is the reason this RPC is bidirectional
+  // instead of an upload followed by a read.
+  //
+  // Errors: no layout, a malformed layout or copybook, a record length
+  // shorter than its prefix, or an undecodable field (a bad COMP-3 nibble, a
+  // non-decimal zoned digit, a byte the code page does not assign) fail the
+  // stream with INVALID_ARGUMENT. A copybook feature outside the supported
+  // subset is UNIMPLEMENTED. Input past the byte cap, or more parses in
+  // flight than the server admits, is RESOURCE_EXHAUSTED.
+  rpc ParseEbcdic(stream ParseEbcdicRequest) returns (stream ParseEbcdicResponse);
+
+  // Returns the server's build identity and decode capabilities. Cheap,
+  // unary, and safe to call on a health-check path.
+  rpc GetServiceInfo(GetServiceInfoRequest) returns (GetServiceInfoResponse);
+}
+
+// ParseEbcdicRequest is one frame of the client-to-server half of the parse
+// stream.
+message ParseEbcdicRequest {
+  // The frame payload. The first frame of a stream must set `options`; every
+  // later frame must set `chunk`.
+  oneof frame {
+    // Decode settings and the layout. First frame only.
+    ParseOptions options = 1;
+
+    // A chunk of the EBCDIC file bytes. Chunks are concatenated in stream
+    // order to form the input. Empty chunks are legal and ignored.
+    bytes chunk = 2;
+  }
+}
+
+// ParseEbcdicResponse is one event of the server-to-client half of the parse
+// stream.
+message ParseEbcdicResponse {
+  // The event payload. A successful stream is exactly one `layout_info`,
+  // then zero or more `record` events, then exactly one `status`.
+  oneof event {
+    // The resolved layout, sent before any input byte is consumed.
+    LayoutInfo layout_info = 1;
+
+    // One decoded record, sent as soon as its last byte has arrived.
+    RecordRow record = 2;
+
+    // The trailer: counts and recoverable warnings.
+    ParseStatus status = 3;
+  }
+}
+
+// GetServiceInfoRequest is the empty request of GetServiceInfo.
+message GetServiceInfoRequest {}
+
+// GetServiceInfoResponse describes what this build of the server can do.
+message GetServiceInfoResponse {
+  // Service name, always `grpc-ebcdic`.
+  string service = 1;
+
+  // Crate version of this build, for example `0.1.0`.
+  string version = 2;
+
+  // Canonical names of every EBCDIC code page this build can decode.
+  repeated string encodings = 3;
+
+  // Code page used when a request leaves `encoding` empty.
+  string default_encoding = 4;
+
+  // Byte cap applied when a request leaves `max_document_mib` at zero, in
+  // mebibytes.
+  uint32 default_max_document_mib = 5;
+
+  // Number of parse streams the server admits at once. Past this, a new
+  // ParseEbcdic call is refused with RESOURCE_EXHAUSTED rather than queued.
+  uint32 max_concurrent_parses = 6;
+
+  // Field types this build decodes. A layout using any other value is
+  // UNIMPLEMENTED.
+  repeated FieldType supported_field_types = 7;
+
+  // Whether this build compiles `ParseOptions.copybook` COBOL source.
+  bool copybook_compiler = 8;
+}

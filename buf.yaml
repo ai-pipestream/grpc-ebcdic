@@ -1,0 +1,17 @@
+# Buf v2 configuration for the grpc-ebcdic protobuf contracts.
+#
+# Linting runs the full STANDARD category plus COMMENTS, so every file,
+# service, rpc, message, field, oneof, enum, and enum value must carry a
+# documentation comment. Comment ignores are disallowed: a rule that does not
+# fit is a contract to change, not a line to silence.
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+    - COMMENTS
+  disallow_comment_ignores: true
+breaking:
+  use:
+    - FILE

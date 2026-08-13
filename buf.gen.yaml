@@ -1,0 +1,18 @@
+# Optional out-of-tree stub generation for the ai.pipestream.ebcdic.v1
+# contracts.
+#
+# The canonical build path is `build.rs` (tonic-prost-build), which needs no
+# tooling beyond cargo. Use `buf generate` when protoc-gen-prost and
+# protoc-gen-tonic are installed locally and you want the generated Rust on
+# disk to read:
+#
+#   cargo install protoc-gen-prost protoc-gen-tonic
+#   buf generate
+#
+# The output is not committed and not compiled; `gen/` is gitignored.
+version: v2
+plugins:
+  - local: protoc-gen-prost
+    out: gen
+  - local: protoc-gen-tonic
+    out: gen
