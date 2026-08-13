@@ -1,0 +1,8 @@
+# Only the crate itself belongs in the build context.
+target/
+.git/
+.gitignore
+docs/
+*.md
+Dockerfile
+.dockerignore
