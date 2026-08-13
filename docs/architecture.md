@@ -3,6 +3,8 @@
 **Status:** spec (no implementation yet)
 **Updated:** 2026-08-13
 
+Implementers start at [`AGENTS.md`](../AGENTS.md), then this file, `design.md`, and `guidelines.md`.
+
 ## Where this sits
 
 EBCDIC is not “just text.” A `.ebc` file is a stream of **fixed-width
