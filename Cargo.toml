@@ -1,0 +1,38 @@
+[package]
+name = "grpc-ebcdic"
+version = "0.1.0"
+description = "A gRPC server that streams copybook-driven EBCDIC records decoded into typed rows"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["ebcdic", "cobol", "copybook", "grpc", "streaming"]
+categories = ["parsing", "network-programming"]
+edition = "2024"
+publish = false
+authors = ["Kristian Rickert <krickert@gmail.com>"]
+repository = "https://git.rokkon.com/ai-pipestream/grpc-ebcdic"
+
+[dependencies]
+prost = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio-stream = "0.1"
+tonic = "0.14"
+tonic-health = "0.14"
+tonic-prost = "0.14"
+tonic-reflection = "0.14"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+# "net" enables TcpListenerStream, which the tests use to serve the real
+# server on an ephemeral port.
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }

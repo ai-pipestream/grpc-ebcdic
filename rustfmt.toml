@@ -1,0 +1,2 @@
+# Defaults, stated so `cargo fmt --check` means the same thing everywhere.
+max_width = 100

@@ -1,3 +1,18 @@
+# Cargo build output.
 /target
+
+# rustfmt backups.
 **/*.rs.bk
+
+# `buf generate` output. The canonical stub path is build.rs, so nothing under
+# gen/ is compiled or committed.
+/gen
+
+# Editors.
 .idea/
+.vscode/
+*.swp
+*~
+
+# OS cruft.
+.DS_Store
