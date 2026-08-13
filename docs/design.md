@@ -5,7 +5,9 @@
 - Feature parity with Docling `InputFormat.EBCDIC` and
   `EbcdicBackendOptions`.
 - Stream rows as soon as a record is decoded. A multi-gigabyte dump
-  must not become one protobuf table in RAM.
+  must not become one protobuf table in RAM. UIs merge rows live;
+  they do not wait for `ParseStatus`. Docling returns the finished
+  tables. We do not.
 - Layout is required and is part of the request, never a file on the
   server.
 

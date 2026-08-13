@@ -26,6 +26,14 @@ schema. This service is that backend over gRPC.
 Without a layout the bytes are an opaque code page. We refuse to
 guess.
 
+## Live results (vs Docling)
+
+Docling's EBCDIC backend decodes the file into tables and returns one
+document. We stream **rows as each record decodes** so a UI can show
+a dump filling in (and a 10 M-row file does not become one frozen
+table in RAM). `LayoutInfo` is the first event; `ParseStatus` is a
+trailer.
+
 ## What this process owns
 
 - Decoding character fields with a named EBCDIC codec (`cp037`,
