@@ -2,6 +2,12 @@
 
 gRPC collector for copybook-driven EBCDIC records, projecting into the gRParse Document data plane
 
+
+## Docs
+
+- [Architecture](docs/architecture.md) — where this sits in the collector fleet
+- [Design](docs/design.md) — wire API, Document mapping, tests
+
 ## Remotes
 
 - **Forgejo** (`git.rokkon.com/ai-pipestream/grpc-ebcdic`) is the source of truth. `main` lives here.
