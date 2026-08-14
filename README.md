@@ -22,7 +22,7 @@ decode.
 
 ```bash
 cargo build --release          # protoc is the only non-Rust build dependency
-cargo test                     # 81 tests, no network, no fixture files
+cargo test                     # 92 tests, no network, no fixture files
 cargo clippy --all-targets     # pedantic, clean
 buf lint                       # STANDARD + COMMENTS, no comment ignores
 ./target/release/grpc-ebcdic   # listens on 0.0.0.0:50051
@@ -69,6 +69,7 @@ rpc GetServiceInfo(GetServiceInfoRequest) returns (GetServiceInfoResponse);
 |---|---|---|
 | 1 | `layout_info` | before a single input byte is read |
 | 2..n | `record` | the moment that record's last byte arrives |
+| n+1 | `document` | only when `emit_document` was set; immediately before the trailer |
 | last | `status` | once the request stream ends |
 
 Rows are never batched, never reordered, and never held back. Records are
@@ -96,6 +97,7 @@ Set on the first frame. Exactly one layout form is required.
 | `strip_control_characters` | `true` | drop Unicode control characters from text |
 | `abort_on_error` | `false` | refuse a trailing partial record instead of warning |
 | `max_document_mib` | server default (512) | per-stream byte cap |
+| `emit_document` | `false` | also fold the parse into one `Document` (see below) |
 
 The three layout forms are a protobuf `oneof`, so "both" cannot be expressed on
 the wire. Sending none of them is `INVALID_ARGUMENT`: the bytes are meaningless
@@ -120,6 +122,49 @@ Types survive. There is no JSON blob and no float anywhere on the value path.
 an `unscaled` int64 when the value fits in 64 bits. A `PIC S9(18)V99 COMP-3` has
 twenty significant digits and an IEEE double has fifteen, so the text is the
 field a client can always trust.
+
+### The Document projection
+
+Set `emit_document` and the server also folds the parse into a single
+`ai.pipestream.document.v1.Document` and sends it as the `document` event,
+**once, immediately before `status`**. The row stream is unchanged: the
+`record` events are still the complete, lossless result, and the Document is a
+lossy structural projection layered on top for callers that want the gRParse
+Document plane straight from the collector.
+
+The mapping is `docs/design.md` §4 made literal, and it lives in
+`src/document_fold.rs`:
+
+- one `GROUP_LABEL_SHEET` group per record schema, named by the schema, under
+  `#/body`, holding exactly its own table;
+- one `TableItem` per schema, its first grid row the field names with
+  `column_header = true` — fillers are not columns;
+- one grid row per record, cells aligned by field name; a `Decimal` cell
+  carries `Decimal.text` character for character, never re-rendered and never
+  a float;
+- `CollectorSource{collector: "ebcdic", model: <proto|json|copybook>, version:
+  <crate version>}` on every table, no `confidence`;
+- no `prov`, no `bbox`, no `origin`, no pages: this stream has byte offsets and
+  a layout, not a page and not a filename. The layout facts live in
+  `body.meta.custom_fields` (`ebcdic.encoding`, `ebcdic.layout_source`,
+  `ebcdic.header_size`, `ebcdic.footer_size`, `ebcdic.prefix_size`) and the
+  per-schema facts in each table's `meta.custom_fields`
+  (`ebcdic.record_length`, `ebcdic.selector`, `ebcdic.rows`).
+
+**Use it with a bounded `max_records`.** A Document is one protobuf message and
+a mainframe extract is not: the fold has to hold every row it folds until the
+parse ends, which is the exact opposite of what the row stream exists for. The
+fold therefore caps itself at **100 000 rows per record schema**. Rows past the
+cap are counted, not folded, and the trailer carries a
+`WARNING_CODE_DOCUMENT_ROWS_TRUNCATED` warning naming the schema, the dropped
+count, and the byte offset of the first dropped record — with the same count in
+that table's `meta.custom_fields["ebcdic.rows_truncated"]`. Nothing is capped
+silently. A caller who wants a whole Document sets `max_records` below the cap;
+a caller who wants every row reads the `record` events, which are never capped.
+
+`document_fold::integrity_errors` checks that the fragment is safe for the
+coordinator's additive merge — unique `self_ref`, symmetric parent/child links,
+no dangling refs — and every fold test asserts it comes back empty.
 
 ### Errors
 
@@ -318,7 +363,7 @@ grpc-ebcdic metrics: parses{started=12,completed=11,failed=1,rejected=0} records
 cargo test
 ```
 
-81 tests, none of which touch the network beyond localhost or the disk at all.
+92 tests, none of which touch the network beyond localhost or the disk at all.
 There are no fixture files: every record is assembled in the test from a
 copybook written as a string literal plus an EBCDIC encoder that writes zoned,
 packed, and binary fields from the COBOL definitions. A round trip is therefore
@@ -329,6 +374,15 @@ non-decimal zoned digit, three code pages over the same bytes, missing layout,
 control-character stripping on and off, byte cap, concurrency cap, unsupported
 copybook feature, malformed copybook, multi-schema selectors, header/footer, and
 the two anti-batch stream assertions.
+
+The Document fold has its own: `src/document_fold.rs` drives real events from a
+real walk into the fold and asserts the group/table structure, the header row,
+the exact decimal text, the source stamps, the custom fields, the row cap's
+warning and counter, and — every time — that `integrity_errors` is empty.
+`tests/parse_stream.rs` proves the wire contract: the event order is exactly
+`layout_info, record…, document, status`, the document arrives once and only
+when asked for, and `emit_document = false` leaves the stream byte-identical to
+what it always was.
 
 ---
 
@@ -360,10 +414,14 @@ the two anti-batch stream assertions.
   asks for the warning, and Docling raises instead. Where Docling silently
   truncates a field whose bytes run past the end of a length-prefixed record,
   this build refuses.
-- **No `Document` mapping yet.** `design.md` §4 describes one `TableItem` per
-  record schema. Per `AGENTS.md`, gRParse wiring is a follow-up: this repo emits
-  the native event stream, and `LayoutInfo` carries the field names a
-  coordinator needs for the header row.
+- **The `Document` mapping is opt-in and bounded.** `design.md` §4 describes one
+  `TableItem` per record schema and is now implemented here, behind
+  `emit_document`. §4 also argued that streaming rows is what keeps a 10 M-row
+  dump from inflating one event, and that argument still stands: the fold is off
+  by default, and when it is on it caps itself per schema and reports what it
+  dropped rather than pretending a Document can hold an extract. gRParse
+  *wiring* (the `COLLECTOR_*` enum, the endpoint) remains the follow-up
+  `AGENTS.md` describes.
 
 ---
 

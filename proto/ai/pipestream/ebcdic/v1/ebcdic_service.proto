@@ -12,6 +12,7 @@ syntax = "proto3";
 
 package ai.pipestream.ebcdic.v1;
 
+import "ai/pipestream/document/v1/document.proto";
 import "ai/pipestream/ebcdic/v1/ebcdic.proto";
 
 option java_multiple_files = true;
@@ -67,7 +68,8 @@ message ParseEbcdicRequest {
 // stream.
 message ParseEbcdicResponse {
   // The event payload. A successful stream is exactly one `layout_info`,
-  // then zero or more `record` events, then exactly one `status`.
+  // then zero or more `record` events, then — when `emit_document` was set —
+  // exactly one `document`, then exactly one `status`.
   oneof event {
     // The resolved layout, sent before any input byte is consumed.
     LayoutInfo layout_info = 1;
@@ -77,6 +79,18 @@ message ParseEbcdicResponse {
 
     // The trailer: counts and recoverable warnings.
     ParseStatus status = 3;
+
+    // The whole parse folded into one Document, with one table per record
+    // schema. Emitted once, immediately before `status`, only when
+    // `emit_document` was set.
+    //
+    // A lossy structural projection of the events above, offered for callers
+    // that want the gRParse Document plane rather than the typed rows: cells
+    // become table text, so a `decimal` cell arrives as its exact canonical
+    // rendering and a client that needs the scale or the sign nibble reads the
+    // `record` events instead. Bounded by a per-schema row cap; see
+    // WARNING_CODE_DOCUMENT_ROWS_TRUNCATED.
+    ai.pipestream.document.v1.Document document = 4;
   }
 }
 

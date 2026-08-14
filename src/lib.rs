@@ -25,6 +25,13 @@
 //!   semantics mirror Docling's `EbcdicDocumentBackend` so the same bytes and
 //!   the same layout yield the same values through either implementation. What
 //!   differs is the shape of the delivery, deliberately.
+//! - **The Document plane is opt-in and bounded.** [`document_fold`] projects
+//!   the parse into one `ai.pipestream.document.v1.Document` — one table per
+//!   record schema — when the request asks for it, emitted immediately before
+//!   the trailer. It is a fold over this crate's own events rather than a
+//!   second parser, it is off by default, and because a Document is one message
+//!   it caps its rows per schema and reports what it dropped instead of
+//!   quietly shortening a table.
 
 pub mod codec;
 mod codepages;
@@ -33,6 +40,7 @@ mod codepages;
 /// [`layout::resolve`].
 mod copybook;
 pub mod decode;
+pub mod document_fold;
 pub mod error;
 pub mod layout;
 pub mod metrics;
@@ -41,6 +49,7 @@ pub mod server;
 pub mod service;
 pub mod stream;
 
+pub use document_fold::DocumentFold;
 pub use error::ParseError;
 pub use metrics::Metrics;
 pub use service::EbcdicGrpc;

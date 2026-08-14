@@ -6,6 +6,11 @@
 //! frame completed, send them, repeat. There is no collecting phase and no
 //! place where a whole document exists, which is both the streaming contract
 //! and the memory bound.
+//!
+//! The one exception is asked for explicitly: with `emit_document` set, every
+//! outbound event also goes through a [`DocumentFold`], which does accumulate
+//! — that is what a Document is — and is therefore off by default and capped
+//! when on. See [`crate::document_fold`].
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -15,6 +20,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::codec::{self, Codec};
+use crate::document_fold::DocumentFold;
 use crate::error::ParseError;
 use crate::layout;
 use crate::metrics::Metrics;
@@ -149,6 +155,11 @@ impl EbcdicParseService for EbcdicGrpc {
         };
         let layout_info = layout.to_layout_info(codec.name());
         let byte_cap = self.byte_cap(&options);
+        // Built here or not at all: with `emit_document` unset there is no
+        // fold, so the row path costs exactly what it cost before.
+        let fold = options
+            .emit_document
+            .then(|| DocumentFold::new(env!("CARGO_PKG_VERSION")));
 
         Metrics::bump(&self.metrics.parses_started);
         let metrics = Arc::clone(&self.metrics);
@@ -163,7 +174,7 @@ impl EbcdicParseService for EbcdicGrpc {
                 RecordStream::new(layout, decode_options),
                 layout_info,
                 byte_cap,
-                &tx,
+                EventSink { tx: &tx, fold },
                 &metrics,
             )
             .await;
@@ -214,6 +225,52 @@ impl EbcdicParseService for EbcdicGrpc {
     }
 }
 
+/// The outbound half of one parse: the channel, and the fold when the request
+/// asked for a Document.
+///
+/// Every event goes out through here, which is what makes "the fold sees
+/// exactly what the client sees" a property of the code rather than of a
+/// convention someone has to remember.
+struct EventSink<'a> {
+    /// Where events go.
+    tx: &'a mpsc::Sender<Result<pb::ParseEbcdicResponse, Status>>,
+    /// The Document fold, when `emit_document` was set.
+    fold: Option<DocumentFold>,
+}
+
+impl EventSink<'_> {
+    /// Fold one event and send it, treating a closed channel as a cancelled
+    /// call.
+    async fn send(&mut self, event: pb::parse_ebcdic_response::Event) -> Result<(), ParseError> {
+        if let Some(fold) = self.fold.as_mut() {
+            fold.consume(&event);
+        }
+        self.tx
+            .send(Ok(pb::ParseEbcdicResponse { event: Some(event) }))
+            .await
+            .map_err(|_| ParseError::internal("the client stopped reading the event stream"))
+    }
+
+    /// Send the trailer, preceded by the Document when one was asked for.
+    ///
+    /// The order is the contract: the fold's own truncation warnings are
+    /// merged into the trailer *before* the fold sees it, the document event
+    /// goes out immediately before the trailer, and the trailer stays last.
+    async fn finish(&mut self, mut status: pb::ParseStatus) -> Result<(), ParseError> {
+        let Some(mut fold) = self.fold.take() else {
+            return self
+                .send(pb::parse_ebcdic_response::Event::Status(status))
+                .await;
+        };
+        status.warnings.extend(fold.truncation_warnings());
+        let status = pb::parse_ebcdic_response::Event::Status(status);
+        fold.consume(&status);
+        self.send(pb::parse_ebcdic_response::Event::Document(fold.take()))
+            .await?;
+        self.send(status).await
+    }
+}
+
 /// Drive one parse from the first data frame to the trailer.
 ///
 /// Every row is awaited onto the channel before the next is decoded, so a
@@ -224,14 +281,11 @@ async fn run_parse(
     mut walk: RecordStream,
     layout_info: pb::LayoutInfo,
     byte_cap: u64,
-    tx: &mpsc::Sender<Result<pb::ParseEbcdicResponse, Status>>,
+    mut sink: EventSink<'_>,
     metrics: &Metrics,
 ) -> Result<(), ParseError> {
-    send(
-        tx,
-        pb::parse_ebcdic_response::Event::LayoutInfo(layout_info),
-    )
-    .await?;
+    sink.send(pb::parse_ebcdic_response::Event::LayoutInfo(layout_info))
+        .await?;
 
     loop {
         let frame = match inbound.message().await {
@@ -260,34 +314,25 @@ async fn run_parse(
         }
         Metrics::add(&metrics.bytes_received, chunk.len() as u64);
         walk.push(&chunk);
-        drain(&mut walk, tx, metrics).await?;
+        drain(&mut walk, &mut sink, metrics).await?;
     }
 
     walk.finish_input();
-    drain(&mut walk, tx, metrics).await?;
+    drain(&mut walk, &mut sink, metrics).await?;
     let status = walk.status()?;
-    send(tx, pb::parse_ebcdic_response::Event::Status(status)).await
+    sink.finish(status).await
 }
 
 /// Emit every record the walk can produce right now.
 async fn drain(
     walk: &mut RecordStream,
-    tx: &mpsc::Sender<Result<pb::ParseEbcdicResponse, Status>>,
+    sink: &mut EventSink<'_>,
     metrics: &Metrics,
 ) -> Result<(), ParseError> {
     while let Some(row) = walk.next_record()? {
         Metrics::bump(&metrics.records_emitted);
-        send(tx, pb::parse_ebcdic_response::Event::Record(row)).await?;
+        sink.send(pb::parse_ebcdic_response::Event::Record(row))
+            .await?;
     }
     Ok(())
-}
-
-/// Send one event, treating a closed channel as a cancelled call.
-async fn send(
-    tx: &mpsc::Sender<Result<pb::ParseEbcdicResponse, Status>>,
-    event: pb::parse_ebcdic_response::Event,
-) -> Result<(), ParseError> {
-    tx.send(Ok(pb::ParseEbcdicResponse { event: Some(event) }))
-        .await
-        .map_err(|_| ParseError::internal("the client stopped reading the event stream"))
 }

@@ -13,6 +13,9 @@ repository = "https://git.rokkon.com/ai-pipestream/grpc-ebcdic"
 
 [dependencies]
 prost = "0.14"
+# google.protobuf.Value, which the vendored document schema uses for the
+# `custom_fields` escape hatch on every item's metadata.
+prost-types = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }

@@ -179,6 +179,20 @@ message ParseOptions {
   // Upper bound on the input, in mebibytes. Zero means the server default.
   // Exceeding it fails the stream with RESOURCE_EXHAUSTED.
   uint32 max_document_mib = 8;
+
+  // Also fold the parse into a single `ai.pipestream.document.v1.Document`
+  // and emit it as the `document` event immediately before the trailer.
+  //
+  // Off by default, and off is the cheap path: with this unset the server
+  // builds nothing and holds nothing beyond the record it is decoding. With
+  // it set the server accumulates every folded row in memory until the parse
+  // ends, because a Document is one protobuf message and a message cannot be
+  // streamed. That is the opposite of what the row stream is for, so pair
+  // this with `max_records` — or accept the server's per-schema fold cap,
+  // which drops the surplus rows and reports
+  // WARNING_CODE_DOCUMENT_ROWS_TRUNCATED in the trailer. The `record` events
+  // are unaffected either way: they remain the complete, lossless result.
+  bool emit_document = 9;
 }
 
 // Decimal is an exact base-10 number: `unscaled * 10^-scale`.
@@ -349,6 +363,16 @@ enum WarningCode {
   // The input was shorter than `header_size` plus `footer_size`, so no record
   // could be read at all.
   WARNING_CODE_INPUT_SHORTER_THAN_BOUNDARIES = 3;
+
+  // `emit_document` was set and one record schema produced more rows than the
+  // server folds into a single Document, so the surplus rows are missing from
+  // that schema's table. The `message` names the schema and how many rows were
+  // dropped, and the table's `meta.custom_fields["ebcdic.rows_truncated"]`
+  // carries the same count; `byte_offset` is where the first dropped record
+  // began. Nothing else is affected: the `record` events carried every row,
+  // and the counts in this trailer are counts of the parse, not of the
+  // Document. Re-run with a smaller `max_records` for a complete Document.
+  WARNING_CODE_DOCUMENT_ROWS_TRUNCATED = 4;
 }
 
 // ParseWarning is one recoverable anomaly, reported in the trailer.

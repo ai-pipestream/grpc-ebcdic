@@ -17,6 +17,8 @@ use tonic::Code;
 use tonic::transport::{Endpoint, Server};
 
 use grpc_ebcdic::codec::Codec;
+use grpc_ebcdic::document_fold;
+use grpc_ebcdic::proto::document::v1 as docpb;
 use grpc_ebcdic::proto::v1 as pb;
 use grpc_ebcdic::proto::v1::ebcdic_parse_service_client::EbcdicParseServiceClient;
 use grpc_ebcdic::{EbcdicGrpc, Metrics};
@@ -230,6 +232,8 @@ struct Parsed {
     layout: pb::LayoutInfo,
     /// Row events in arrival order.
     rows: Vec<pb::RecordRow>,
+    /// The folded Document, present only when `emit_document` was set.
+    document: Option<docpb::Document>,
     /// The trailer.
     status: pb::ParseStatus,
 }
@@ -250,6 +254,7 @@ async fn parse(
 
     let mut layout = None;
     let mut rows = Vec::new();
+    let mut document = None;
     let mut status = None;
     while let Some(event) = stream.message().await? {
         match event.event.expect("every event carries a payload") {
@@ -260,7 +265,13 @@ async fn parse(
             }
             pb::parse_ebcdic_response::Event::Record(row) => {
                 assert!(status.is_none(), "no row may follow the trailer");
+                assert!(document.is_none(), "no row may follow the document");
                 rows.push(row);
+            }
+            pb::parse_ebcdic_response::Event::Document(folded) => {
+                assert!(document.is_none(), "the document arrives at most once");
+                assert!(status.is_none(), "the document arrives before the trailer");
+                document = Some(folded);
             }
             pb::parse_ebcdic_response::Event::Status(trailer) => {
                 assert!(status.is_none(), "the trailer arrives exactly once");
@@ -271,6 +282,7 @@ async fn parse(
     Ok(Parsed {
         layout: layout.expect("a successful parse always opens with layout_info"),
         rows,
+        document,
         status: status.expect("a successful parse always ends with a trailer"),
     })
 }
@@ -1023,6 +1035,189 @@ async fn a_header_and_footer_are_skipped_around_the_records() {
             pb::cell::Value::Text("AAAA".into()),
             pb::cell::Value::Text("BBBB".into()),
         ]
+    );
+    assert!(
+        parsed.status.warnings.is_empty(),
+        "{:?}",
+        parsed.status.warnings
+    );
+}
+
+/// Name each event kind so an ordering assertion reads as the contract does.
+fn event_kind(event: &pb::ParseEbcdicResponse) -> &'static str {
+    match event.event.as_ref().expect("every event carries a payload") {
+        pb::parse_ebcdic_response::Event::LayoutInfo(_) => "layout_info",
+        pb::parse_ebcdic_response::Event::Record(_) => "record",
+        pb::parse_ebcdic_response::Event::Document(_) => "document",
+        pb::parse_ebcdic_response::Event::Status(_) => "status",
+    }
+}
+
+/// The text of every cell of one grid row of a folded table.
+fn grid_row(table: &docpb::TableItem, row: usize) -> Vec<String> {
+    table.data.as_ref().unwrap().grid[row]
+        .cells
+        .iter()
+        .map(|cell| cell.text.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn the_document_event_arrives_once_immediately_before_the_trailer() {
+    let client = start_server().await;
+    let mut client = client.clone();
+    let options = pb::ParseOptions {
+        emit_document: true,
+        ..customer_options()
+    };
+    let mut data = Vec::new();
+    data.extend(customer(1, "ACME SUPPLY", -123_456_789, 42));
+    data.extend(customer(2, "BETA WORKS", 0, 0));
+
+    let frames = vec![options_frame(options), chunk_frame(&data)];
+    let mut stream = client
+        .parse_ebcdic(tokio_stream::iter(frames))
+        .await
+        .expect("open the call")
+        .into_inner();
+
+    let mut kinds = Vec::new();
+    let mut document = None;
+    while let Some(event) = stream.message().await.expect("stream is healthy") {
+        kinds.push(event_kind(&event));
+        if let Some(pb::parse_ebcdic_response::Event::Document(folded)) = event.event {
+            document = Some(folded);
+        }
+    }
+    // The whole ordering contract in one assertion: the rows still stream, the
+    // document is folded from them, and the trailer is still last.
+    assert_eq!(
+        kinds,
+        vec!["layout_info", "record", "record", "document", "status"]
+    );
+
+    let document = document.expect("emit_document was set");
+    assert!(
+        document_fold::integrity_errors(&document).is_empty(),
+        "{:?}",
+        document_fold::integrity_errors(&document)
+    );
+    assert_eq!(document.schema_name.as_deref(), Some("docling_document_v2"));
+    // No description on the copybook, so the schema names the document.
+    assert_eq!(document.name, "CUSTOMER-RECORD");
+    assert_eq!(document.groups.len(), 1);
+    assert_eq!(document.groups[0].label, docpb::GroupLabel::Sheet as i32);
+    assert_eq!(document.tables.len(), 1);
+
+    let table = &document.tables[0];
+    assert_eq!(
+        grid_row(table, 0),
+        vec!["CUST-ID", "CUST-NAME", "CUST-BALANCE", "CUST-ORDER-COUNT"],
+        "the header is the field names, the filler excluded"
+    );
+    // The same values as the typed cells, with the decimal's exact text.
+    assert_eq!(
+        grid_row(table, 1),
+        vec!["1", "ACME SUPPLY", "-1234567.89", "42"]
+    );
+    assert_eq!(grid_row(table, 2), vec!["2", "BETA WORKS", "0.00", "0"]);
+    assert_eq!(table.data.as_ref().unwrap().num_rows, 3);
+    assert_eq!(table.data.as_ref().unwrap().num_cols, 4);
+
+    let Some(docpb::source_type::Source::Collector(collector)) = table.source[0].source.as_ref()
+    else {
+        panic!("every table is attributed to this collector");
+    };
+    assert_eq!(collector.collector, "ebcdic");
+    assert_eq!(collector.model.as_deref(), Some("copybook"));
+    assert_eq!(
+        collector.version.as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[tokio::test]
+async fn without_emit_document_the_stream_is_exactly_what_it_always_was() {
+    let client = start_server().await;
+    let data = customer(1, "ACME SUPPLY", -123_456_789, 42);
+
+    let plain = parse(&client, customer_options(), &data).await.unwrap();
+    assert!(
+        plain.document.is_none(),
+        "a document nobody asked for is a document nobody can afford"
+    );
+
+    let folded = parse(
+        &client,
+        pb::ParseOptions {
+            emit_document: true,
+            ..customer_options()
+        },
+        &data,
+    )
+    .await
+    .unwrap();
+    assert!(folded.document.is_some());
+    // The projection is additive: the typed stream is untouched by it.
+    assert_eq!(folded.rows, plain.rows);
+    assert_eq!(folded.layout, plain.layout);
+    assert_eq!(folded.status, plain.status);
+}
+
+#[tokio::test]
+async fn a_folded_document_carries_the_layout_facts_and_the_row_count() {
+    let client = start_server().await;
+    let layout = pb::EbcdicLayout {
+        description: "NIGHTLY EXTRACT".into(),
+        header_size: 8,
+        records: vec![pb::EbcdicRecordLayout {
+            name: "ROW".into(),
+            selector: None,
+            fields: vec![pb::EbcdicField {
+                name: "VALUE".into(),
+                size: 4,
+                r#type: pb::FieldType::String as i32,
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    };
+    let options = pb::ParseOptions {
+        layout_source: Some(pb::parse_options::LayoutSource::Layout(layout)),
+        emit_document: true,
+        ..Default::default()
+    };
+    let data = Encoder::new("cp037")
+        .text("HEADER01", 8)
+        .text("AAAA", 4)
+        .text("BBBB", 4)
+        .build();
+
+    let parsed = parse(&client, options, &data).await.unwrap();
+    let document = parsed.document.expect("emit_document was set");
+    // The layout's description is a better name than a schema name is.
+    assert_eq!(document.name, "NIGHTLY EXTRACT");
+
+    let fields = &document
+        .body
+        .as_ref()
+        .unwrap()
+        .meta
+        .as_ref()
+        .unwrap()
+        .custom_fields;
+    assert!(fields.contains_key("ebcdic.encoding"));
+    assert!(fields.contains_key("ebcdic.layout_source"));
+    assert!(fields.contains_key("ebcdic.header_size"));
+    assert!(fields.contains_key("ebcdic.footer_size"));
+    assert!(fields.contains_key("ebcdic.prefix_size"));
+
+    let fields = &document.tables[0].meta.as_ref().unwrap().custom_fields;
+    assert!(fields.contains_key("ebcdic.record_length"));
+    assert!(fields.contains_key("ebcdic.rows"));
+    assert!(
+        !fields.contains_key("ebcdic.rows_truncated"),
+        "nothing was dropped, so nothing claims to have been"
     );
     assert!(
         parsed.status.warnings.is_empty(),

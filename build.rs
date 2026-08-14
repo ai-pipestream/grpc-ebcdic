@@ -15,6 +15,10 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_root = "proto";
     let protos = [
+        // Vendored byte-identical from the gRParse repo, which owns it. The
+        // Document projection is optional on the wire but the schema is not
+        // optional at build time: the response oneof references it.
+        "proto/ai/pipestream/document/v1/document.proto",
         "proto/ai/pipestream/ebcdic/v1/ebcdic.proto",
         "proto/ai/pipestream/ebcdic/v1/ebcdic_service.proto",
     ];
