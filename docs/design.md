@@ -76,9 +76,18 @@ want the Document plane from the collector itself:
   `WARNING_CODE_DOCUMENT_ROWS_TRUNCATED` naming the schema and the
   dropped count, with the same count in the table's
   `meta.custom_fields["ebcdic.rows_truncated"]`. There is no silent cap.
-  Pair `emit_document` with `max_records` for a whole Document.
+  Pair `emit_document` with `max_records` for a whole Document. Dropping
+  rows is not the same as matching none: a schema whose rows were all
+  dropped still gets its table, carrying the count that says so, while a
+  schema the input never mentioned is left out of the document.
 
 ### Shape
+
+The shape mirrors docling's own EBCDIC backend
+(`docling/backend/ebcdic_backend.py`, `convert()`), which builds a **flat**
+document: no groups, the description first, a heading per schema only
+when the layout declares more than one, and the tables as siblings of
+those headings rather than children. Everything hangs off `#/body`.
 
 | Document | Source |
 |---|---|
@@ -86,11 +95,20 @@ want the Document plane from the collector itself:
 | `name` | `LayoutInfo.description`, else the first schema name |
 | `origin` | unset — the stream carries bytes and a layout, never a filename or a media type |
 | `body.meta.custom_fields` | `ebcdic.encoding`, `ebcdic.layout_source`, `ebcdic.header_size`, `ebcdic.footer_size`, `ebcdic.prefix_size` |
-| one `GroupItem` per record schema | `GROUP_LABEL_SHEET`, named by the schema, child of `#/body`, holding exactly its own table |
-| one `TableItem` per record schema | grid row 0 is the field names with `column_header = true`, one non-`SKIP` field per column |
+| `groups` | empty: the upstream backend uses none, so neither does this |
+| one `TextItem` (`TEXT`) | the layout description, when there is one, first on `#/body` |
+| one `SectionHeaderItem` per record schema | the schema name, level 1, on `#/body` — **only when the layout declares more than one schema**, exactly as upstream |
+| one `TableItem` per record schema | on `#/body`, the heading's *sibling*; grid row 0 is the field names with `column_header = true`, one non-`SKIP` field per column |
+| a schema that matched no record | nothing at all: no heading, no table |
 | one grid row per `RecordRow` | cells aligned by name against the schema's fields; `text` verbatim, `Decimal` as `Decimal.text` exactly, `integer` as its decimal string |
-| `table.meta.custom_fields` | `ebcdic.record_length`, `ebcdic.selector` (when the layout has one), `ebcdic.rows`, `ebcdic.rows_truncated` (only when rows were dropped) |
-| `CollectorSource` on every table | `collector = "ebcdic"`, `model` = the layout form (`proto` / `json` / `copybook`), `version` = the server's crate version |
+| `table.meta.custom_fields` | `ebcdic.schema`, `ebcdic.record_length`, `ebcdic.selector` (when the layout has one), `ebcdic.rows`, `ebcdic.rows_truncated` (only when rows were dropped) |
+| `CollectorSource` on every item | `collector = "ebcdic"`, `model` = the layout form (`proto` / `json` / `copybook`), `version` = the server's crate version |
+
+One field goes past upstream: `table.meta.custom_fields["ebcdic.schema"]`
+always names the record schema. Docling names a schema only through the
+heading it emits when there is more than one, so a single-schema document
+loses the name entirely; naming it in the table's own metadata keeps every
+table self-describing without changing the item shape.
 
 ### Deliberately not mapped
 

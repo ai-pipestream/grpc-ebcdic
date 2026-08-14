@@ -26,8 +26,10 @@
 //!   the same layout yield the same values through either implementation. What
 //!   differs is the shape of the delivery, deliberately.
 //! - **The Document plane is opt-in and bounded.** [`document_fold`] projects
-//!   the parse into one `ai.pipestream.document.v1.Document` — one table per
-//!   record schema — when the request asks for it, emitted immediately before
+//!   the parse into one `ai.pipestream.document.v1.Document` — flat under the
+//!   body, one table per record schema that matched a record, exactly as
+//!   docling's own backend builds it — when the request asks for it, emitted
+//!   immediately before
 //!   the trailer. It is a fold over this crate's own events rather than a
 //!   second parser, it is off by default, and because a Document is one message
 //!   it caps its rows per schema and reports what it dropped instead of

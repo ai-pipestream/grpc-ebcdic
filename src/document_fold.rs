@@ -10,14 +10,30 @@
 //! service writes to the wire, in the order it writes them, so there is no way
 //! for the Document to describe a parse that did not happen.
 //!
-//! The shape is `docs/design.md` §4 made literal:
+//! The shape is `docs/design.md` §4 made literal, and §4 in turn mirrors
+//! docling's own EBCDIC backend (`docling/backend/ebcdic_backend.py`), which
+//! builds a flat document with no groups at all:
 //!
-//! - one [`GroupItem`](crate::proto::document::v1::GroupItem) per record
-//!   schema, labelled `GROUP_LABEL_SHEET`, hanging off `#/body`;
-//! - one [`TableItem`](crate::proto::document::v1::TableItem) inside each of
-//!   those groups, its first grid row the schema's field names;
-//! - one grid row per [`RecordRow`](crate::proto::v1::RecordRow), cells in
-//!   field order, decimals carried across as their exact canonical text.
+//! - the layout description, when there is one, is the first item: a
+//!   [`TextItem`](crate::proto::document::v1::TextItem) labelled `TEXT` on
+//!   `#/body`;
+//! - then, per record schema in layout order, a
+//!   [`SectionHeaderItem`](crate::proto::document::v1::SectionHeaderItem)
+//!   naming the schema — only when the layout declares more than one, exactly
+//!   as upstream — followed by the schema's
+//!   [`TableItem`](crate::proto::document::v1::TableItem). Both hang directly
+//!   off `#/body`: the table is the heading's *sibling*, not its child;
+//! - a schema that matched no record produces nothing, so a Document never
+//!   shows a table a reader would find empty;
+//! - each table's first grid row is the schema's field names, then one grid row
+//!   per [`RecordRow`](crate::proto::v1::RecordRow), cells in field order,
+//!   decimals carried across as their exact canonical text.
+//!
+//! One thing is deliberately kept past docling: every table carries its schema
+//! name in `meta.custom_fields["ebcdic.schema"]`. Upstream loses that name
+//! entirely in the single-schema case, where it emits no heading, and a table
+//! that cannot say which copybook record it holds is worth less than the two
+//! dozen bytes the field costs.
 //!
 //! Two properties are load-bearing and are asserted in the tests:
 //!
@@ -62,12 +78,15 @@ const BODY_REF: &str = "#/body";
 /// JSON-Pointer self reference of the furniture group.
 const FURNITURE_REF: &str = "#/furniture";
 
-/// One record schema's table, and the counters the finalizer needs.
+/// One record schema's rows, and the counters the finalizer needs.
+///
+/// The rows are held here rather than in the document arena because a schema
+/// that matches no record is not written to the document at all: nothing can be
+/// appended to the arenas until the last event has been seen and the empty
+/// schemas are known.
 struct TableState {
     /// Schema name, as it appears on every row and in the warning message.
     name: String,
-    /// Index of this schema's table in `Document.tables`.
-    table: usize,
     /// Non-filler field names in field order: the header row, and the column
     /// order every data row is aligned to.
     columns: Vec<String>,
@@ -79,12 +98,14 @@ struct TableState {
     /// Record-type value that selects this schema, when the layout has more
     /// than one.
     selector: Option<String>,
-    /// Data rows folded into the table so far, header row excluded.
+    /// Data rows folded so far, header row excluded.
     rows: u64,
     /// Rows seen past the cap and therefore not folded.
     dropped: u64,
     /// Input offset of the first dropped record, for the warning.
     first_dropped_offset: u64,
+    /// The folded data rows, in arrival order, header row excluded.
+    grid: Vec<doc::TableRow>,
 }
 
 /// A single-pass fold from parse events to one Document.
@@ -106,6 +127,8 @@ pub struct DocumentFold {
     tables: Vec<TableState>,
     /// Table state index by schema name.
     index_by_schema: BTreeMap<String, usize>,
+    /// The layout's description, which becomes the document's first text item.
+    description: String,
     /// Whether the opening `layout_info` has been folded.
     started: bool,
 }
@@ -138,6 +161,7 @@ impl DocumentFold {
             row_cap: DEFAULT_ROW_CAP,
             tables: Vec::new(),
             index_by_schema: BTreeMap::new(),
+            description: String::new(),
             started: false,
         }
     }
@@ -154,9 +178,9 @@ impl DocumentFold {
 
     /// Fold one outbound event.
     ///
-    /// Cheap and stateful: `layout_info` builds the groups, the tables, and
-    /// their header rows; each `record` appends one grid row to its schema's
-    /// table or counts itself as dropped.
+    /// Cheap and stateful: `layout_info` works out the columns of every record
+    /// schema; each `record` appends one grid row to its schema's rows or
+    /// counts itself as dropped.
     pub fn consume(&mut self, event: &pb::parse_ebcdic_response::Event) {
         match event {
             pb::parse_ebcdic_response::Event::LayoutInfo(info) => self.begin(info),
@@ -199,49 +223,45 @@ impl DocumentFold {
 
     /// Finish the fold and hand back the Document.
     ///
-    /// Sets each table's dimensions and metadata: everything that is only
-    /// knowable once the last row has been seen.
+    /// This is where the document is written: the description, then the
+    /// schemas in layout order, each one a heading and a table or — when it
+    /// matched no record — nothing at all. Which schemas those are is only
+    /// knowable once the last row has been seen, so the arenas stay empty
+    /// until now.
     #[must_use]
     pub fn take(mut self) -> doc::Document {
-        for state in &self.tables {
-            let Some(table) = self.document.tables.get_mut(state.table) else {
+        let description = std::mem::take(&mut self.description);
+        if !description.is_empty() {
+            self.add_description(&description);
+        }
+        let states = std::mem::take(&mut self.tables);
+        // Upstream keys the headings off the declared schema count, not the
+        // surviving one, so a two-schema layout with one empty schema still
+        // says which schema the surviving table is.
+        let headings = states.len() > 1;
+        for state in states {
+            // Empty means "no record of this schema was in the input". A
+            // schema whose rows were all dropped by the cap did occur, and its
+            // table carries the truncation count that says so.
+            if state.rows == 0 && state.dropped == 0 {
                 continue;
-            };
-            let mut custom_fields = HashMap::new();
-            custom_fields.insert(
-                "ebcdic.record_length".to_string(),
-                number_value(u64::from(state.record_length)),
-            );
-            if let Some(selector) = state.selector.as_ref() {
-                custom_fields.insert("ebcdic.selector".to_string(), string_value(selector));
             }
-            custom_fields.insert("ebcdic.rows".to_string(), number_value(state.rows));
-            if state.dropped > 0 {
-                custom_fields.insert(
-                    "ebcdic.rows_truncated".to_string(),
-                    number_value(state.dropped),
-                );
+            if headings {
+                self.add_heading(&state.name);
             }
-            table.meta = Some(doc::FloatingMeta {
-                custom_fields,
-                ..Default::default()
-            });
-            if let Some(data) = table.data.as_mut() {
-                // The header row is a row of the grid, so the count includes it.
-                data.num_rows = clamp(state.rows.saturating_add(1));
-                data.num_cols = clamp(state.columns.len() as u64);
-            }
+            self.add_table(state);
         }
         self.document
     }
 
-    /// Build the groups, the tables, and the header rows from the layout.
+    /// Work out the columns of every record schema and the document's facts.
     fn begin(&mut self, info: &pb::LayoutInfo) {
         if self.started {
             return;
         }
         self.started = true;
         self.model = layout_source_name(info.source).map(str::to_string);
+        self.description.clone_from(&info.description);
 
         // The layout's own description is the best name available; a file of
         // EBCDIC bytes has no title of its own. Failing that, the first record
@@ -279,17 +299,12 @@ impl DocumentFold {
         }
 
         for schema in &info.records {
-            // A record schema is a sheet of a workbook in every way that
-            // matters here: a named grid with its own columns, sitting beside
-            // the other schemas of the same file.
-            let group_ref = self.add_group(&schema.name);
             let columns: Vec<String> = schema
                 .fields
                 .iter()
                 .filter(|field| field.r#type != pb::FieldType::Skip as i32)
                 .map(|field| field.name.clone())
                 .collect();
-            let table = self.add_table(&group_ref, &columns);
             let column_index = columns
                 .iter()
                 .enumerate()
@@ -299,7 +314,6 @@ impl DocumentFold {
                 .insert(schema.name.clone(), self.tables.len());
             self.tables.push(TableState {
                 name: schema.name.clone(),
-                table,
                 columns,
                 column_index,
                 record_length: schema.record_length,
@@ -307,6 +321,7 @@ impl DocumentFold {
                 rows: 0,
                 dropped: 0,
                 first_dropped_offset: 0,
+                grid: Vec::new(),
             });
         }
     }
@@ -328,7 +343,6 @@ impl DocumentFold {
         }
         let grid_row = state.rows + 1;
         state.rows += 1;
-        let table_index = state.table;
         // Cells arrive named, so they are placed by name rather than by
         // position: a short row leaves its columns empty instead of shifting
         // every later value one column to the left.
@@ -344,82 +358,116 @@ impl DocumentFold {
             .enumerate()
             .map(|(column, text)| table_cell(text, grid_row, column, false))
             .collect();
-        if let Some(data) = self.document.tables[table_index].data.as_mut() {
-            // Both arenas, always: a consumer may read the flat cells or walk
-            // the grid, and a document where those two disagree is worse than
-            // one that carries neither.
-            data.table_cells.extend(cells.iter().cloned());
-            data.grid.push(doc::TableRow { cells });
+        state.grid.push(doc::TableRow { cells });
+    }
+
+    /// Append the layout description as the document's opening text item.
+    fn add_description(&mut self, text: &str) {
+        let base = self.text_base(doc::DocItemLabel::Text, text);
+        self.document.texts.push(doc::BaseTextItem {
+            item: Some(doc::base_text_item::Item::Text(doc::TextItem {
+                base: Some(base),
+            })),
+        });
+    }
+
+    /// Append a section header naming a record schema.
+    ///
+    /// A sibling of its table rather than its parent, which is upstream's
+    /// shape: `DoclingDocument.add_heading` appends to the current parent and
+    /// the table that follows it appends to the same one.
+    fn add_heading(&mut self, name: &str) {
+        let base = self.text_base(doc::DocItemLabel::SectionHeader, name);
+        self.document.texts.push(doc::BaseTextItem {
+            item: Some(doc::base_text_item::Item::SectionHeader(
+                doc::SectionHeaderItem {
+                    base: Some(base),
+                    // The schemas of a layout are siblings, so their headings
+                    // are all at the one level upstream's add_heading defaults
+                    // to.
+                    level: 1,
+                },
+            )),
+        });
+    }
+
+    /// The base of one text item on `#/body`, linked in both directions.
+    ///
+    /// The self ref is the next free slot of the text arena and the body is
+    /// already pointing at it, so the caller has to push the item it wraps
+    /// straight away.
+    fn text_base(&mut self, label: doc::DocItemLabel, text: &str) -> doc::TextItemBase {
+        let self_ref = format!("#/texts/{}", self.document.texts.len());
+        self.link_body_child(&self_ref);
+        doc::TextItemBase {
+            self_ref,
+            parent: Some(ref_item(BODY_REF)),
+            content_layer: doc::ContentLayer::Body as i32,
+            label: label as i32,
+            // No prov, for the reason the tables carry none.
+            orig: text.to_string(),
+            text: text.to_string(),
+            source: vec![self.collector_source()],
+            ..Default::default()
         }
     }
 
-    /// Append a sheet group under the body and return its self reference.
-    fn add_group(&mut self, name: &str) -> String {
-        let self_ref = format!("#/groups/{}", self.document.groups.len());
-        self.document.groups.push(doc::GroupItem {
-            self_ref: self_ref.clone(),
-            parent: Some(ref_item(BODY_REF)),
-            content_layer: doc::ContentLayer::Body as i32,
-            name: Some(name.to_string()),
-            label: doc::GroupLabel::Sheet as i32,
-            ..Default::default()
-        });
-        self.link_child(BODY_REF, &self_ref);
-        self_ref
-    }
-
-    /// Append a table under `parent_ref` with its header row already in place,
-    /// and return its index in the table arena.
-    fn add_table(&mut self, parent_ref: &str, columns: &[String]) -> usize {
-        let index = self.document.tables.len();
-        let self_ref = format!("#/tables/{index}");
-        let header: Vec<doc::TableCell> = columns
+    /// Append one schema's table to the body: header row, data rows, and the
+    /// facts that are only knowable now the rows are all in.
+    fn add_table(&mut self, mut state: TableState) {
+        let self_ref = format!("#/tables/{}", self.document.tables.len());
+        let custom_fields = table_custom_fields(&state);
+        let header: Vec<doc::TableCell> = state
+            .columns
             .iter()
             .enumerate()
             .map(|(column, name)| table_cell(name.clone(), 0, column, true))
             .collect();
+        // Both arenas, always: a consumer may read the flat cells or walk the
+        // grid, and a document where those two disagree is worse than one that
+        // carries neither.
+        let mut table_cells = header.clone();
+        for row in &state.grid {
+            table_cells.extend(row.cells.iter().cloned());
+        }
+        let mut grid = vec![doc::TableRow { cells: header }];
+        grid.append(&mut state.grid);
+
         let source = self.collector_source();
+        self.link_body_child(&self_ref);
         self.document.tables.push(doc::TableItem {
-            self_ref: self_ref.clone(),
-            parent: Some(ref_item(parent_ref)),
+            self_ref,
+            parent: Some(ref_item(BODY_REF)),
             content_layer: doc::ContentLayer::Body as i32,
             label: doc::DocItemLabel::Table as i32,
             // No prov: an EBCDIC record has a byte offset, not a page and not
             // a box. The offsets live in the typed `record` events, which is
             // where a caller that needs them should be looking.
+            meta: Some(doc::FloatingMeta {
+                custom_fields,
+                ..Default::default()
+            }),
             data: Some(doc::TableData {
-                table_cells: header.clone(),
-                grid: vec![doc::TableRow { cells: header }],
-                // Dimensions are set at finalize, when the row count is known.
+                // The header row is a row of the grid, so the count includes it.
+                num_rows: clamp(state.rows.saturating_add(1)),
+                num_cols: clamp(state.columns.len() as u64),
+                table_cells,
+                grid,
                 ..Default::default()
             }),
             source: vec![source],
             ..Default::default()
         });
-        self.link_child(parent_ref, &self_ref);
-        index
     }
 
-    /// Record `child_ref` in its parent's children list.
+    /// Record `child_ref` in the body's children list.
     ///
     /// The other half of the parent pointer: the merge walks children, the
     /// integrity check walks both, and a link written in one direction only is
     /// a fragment that silently loses items downstream.
-    fn link_child(&mut self, parent_ref: &str, child_ref: &str) {
-        let child = ref_item(child_ref);
-        if parent_ref == BODY_REF {
-            if let Some(body) = self.document.body.as_mut() {
-                body.children.push(child);
-            }
-            return;
-        }
-        if let Some(group) = self
-            .document
-            .groups
-            .iter_mut()
-            .find(|group| group.self_ref == parent_ref)
-        {
-            group.children.push(child);
+    fn link_body_child(&mut self, child_ref: &str) {
+        if let Some(body) = self.document.body.as_mut() {
+            body.children.push(ref_item(child_ref));
         }
     }
 
@@ -436,6 +484,32 @@ impl DocumentFold {
             })),
         }
     }
+}
+
+/// The custom fields of one schema's table.
+///
+/// `ebcdic.schema` is the one field upstream has no equivalent of: docling
+/// names a schema only through the heading it emits when there is more than
+/// one, so a single-schema document loses the name altogether. Naming it here
+/// costs nothing and keeps every table self-describing.
+fn table_custom_fields(state: &TableState) -> HashMap<String, Value> {
+    let mut custom_fields = HashMap::new();
+    custom_fields.insert("ebcdic.schema".to_string(), string_value(&state.name));
+    custom_fields.insert(
+        "ebcdic.record_length".to_string(),
+        number_value(u64::from(state.record_length)),
+    );
+    if let Some(selector) = state.selector.as_ref() {
+        custom_fields.insert("ebcdic.selector".to_string(), string_value(selector));
+    }
+    custom_fields.insert("ebcdic.rows".to_string(), number_value(state.rows));
+    if state.dropped > 0 {
+        custom_fields.insert(
+            "ebcdic.rows_truncated".to_string(),
+            number_value(state.dropped),
+        );
+    }
+    custom_fields
 }
 
 /// Render one decoded cell as table text.
@@ -813,6 +887,37 @@ mod tests {
             .collect()
     }
 
+    /// The base of a text item, whichever variant it is.
+    fn text_base(item: &doc::BaseTextItem) -> &doc::TextItemBase {
+        match item.item.as_ref().expect("the variant is set") {
+            doc::base_text_item::Item::Text(value) => value.base.as_ref(),
+            doc::base_text_item::Item::SectionHeader(value) => value.base.as_ref(),
+            other => panic!("this fold only writes text and section headers, not {other:?}"),
+        }
+        .expect("the base is set")
+    }
+
+    /// The `DocItemLabel` of a text item.
+    fn text_label(item: &doc::BaseTextItem) -> i32 {
+        text_base(item).label
+    }
+
+    /// The text of a text item, which is also its `orig`.
+    fn text_of(item: &doc::BaseTextItem) -> String {
+        let base = text_base(item);
+        assert_eq!(base.orig, base.text, "orig and text say the same thing");
+        base.text.clone()
+    }
+
+    /// The collector attribution of one item's source list.
+    fn collector(source: &[doc::SourceType]) -> doc::CollectorSource {
+        assert_eq!(source.len(), 1, "exactly one attribution per item");
+        let Some(doc::source_type::Source::Collector(collector)) = source[0].source.as_ref() else {
+            panic!("the source is a collector attribution");
+        };
+        collector.clone()
+    }
+
     /// A custom field, as a string.
     fn custom_string(
         fields: &std::collections::HashMap<String, prost_types::Value>,
@@ -836,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn every_record_schema_becomes_one_sheet_group_holding_one_table() {
+    fn a_multi_schema_layout_is_a_flat_run_of_headings_and_their_tables() {
         let mut data = customer("JANE", [0x12, 0x34, 0x5d]);
         data.extend(order("042"));
         data.extend(customer("BOB!", [0x00, 0x10, 0x0c]));
@@ -847,41 +952,64 @@ mod tests {
         );
 
         assert_eq!(document.schema_name.as_deref(), Some(SCHEMA_NAME));
-        // The layout's description names the document; the schema names name
-        // the sheets.
+        // The layout's description names the document and opens it.
         assert_eq!(document.name, "ACCOUNTS EXTRACT");
         assert!(document.origin.is_none(), "the stream carries no filename");
-        assert!(document.texts.is_empty() && document.pictures.is_empty());
+        assert!(document.pictures.is_empty());
         assert!(
             document.field_regions.is_empty() && document.field_items.is_empty(),
             "the coordinator's merge drops these silently"
         );
         assert!(document.pages.is_empty(), "an EBCDIC file has no pages");
 
-        assert_eq!(document.groups.len(), 2);
+        assert!(
+            document.groups.is_empty(),
+            "docling's EBCDIC backend uses no groups and neither does this"
+        );
         assert_eq!(document.tables.len(), 2);
+        // Description, then heading and table per schema, all siblings on the
+        // body, in layout order.
         let body = document.body.as_ref().unwrap();
         assert_eq!(
             body.children
                 .iter()
                 .map(|child| child.r#ref.as_str())
                 .collect::<Vec<_>>(),
-            vec!["#/groups/0", "#/groups/1"]
+            vec![
+                "#/texts/0",
+                "#/texts/1",
+                "#/tables/0",
+                "#/texts/2",
+                "#/tables/1"
+            ]
+        );
+        assert_eq!(
+            document
+                .texts
+                .iter()
+                .map(|item| (text_label(item), text_of(item)))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    doc::DocItemLabel::Text as i32,
+                    "ACCOUNTS EXTRACT".to_string()
+                ),
+                (
+                    doc::DocItemLabel::SectionHeader as i32,
+                    "CUSTOMER".to_string()
+                ),
+                (doc::DocItemLabel::SectionHeader as i32, "ORDER".to_string()),
+            ]
         );
         for (index, name) in ["CUSTOMER", "ORDER"].iter().enumerate() {
-            let group = &document.groups[index];
-            assert_eq!(group.label, doc::GroupLabel::Sheet as i32);
-            assert_eq!(group.name.as_deref(), Some(*name));
-            assert_eq!(group.parent.as_ref().unwrap().r#ref, "#/body");
+            let table = &document.tables[index];
             assert_eq!(
-                group
-                    .children
-                    .iter()
-                    .map(|child| child.r#ref.as_str())
-                    .collect::<Vec<_>>(),
-                vec![format!("#/tables/{index}")],
-                "a sheet holds exactly its own table"
+                table.parent.as_ref().unwrap().r#ref,
+                "#/body",
+                "a table is the heading's sibling, not its child"
             );
+            let fields = &table.meta.as_ref().unwrap().custom_fields;
+            assert_eq!(custom_string(fields, "ebcdic.schema"), *name);
         }
 
         // The filler is not a column: it has no name and no cell.
@@ -968,19 +1096,24 @@ mod tests {
     }
 
     #[test]
-    fn every_table_is_stamped_with_the_collector_the_dialect_and_the_version() {
+    fn every_item_is_stamped_with_the_collector_the_dialect_and_the_version() {
+        let mut data = customer("JANE", [0x12, 0x34, 0x5d]);
+        data.extend(order("042"));
         let document = fold(
             &options(two_schema_layout()),
-            &customer("JANE", [0x12, 0x34, 0x5d]),
+            &data,
             DocumentFold::new(VERSION),
         );
-        for table in &document.tables {
-            assert_eq!(table.source.len(), 1);
-            let Some(doc::source_type::Source::Collector(collector)) =
-                table.source[0].source.as_ref()
-            else {
-                panic!("the source is a collector attribution");
-            };
+        // The description, both headings, and both tables: every item this
+        // fold creates is attributed, not just the ones carrying rows.
+        let sources: Vec<_> = document
+            .texts
+            .iter()
+            .map(|item| collector(&text_base(item).source))
+            .chain(document.tables.iter().map(|table| collector(&table.source)))
+            .collect();
+        assert_eq!(sources.len(), 5);
+        for collector in sources {
             assert_eq!(collector.collector, COLLECTOR);
             assert_eq!(collector.model.as_deref(), Some("proto"));
             assert_eq!(collector.version.as_deref(), Some(VERSION));
@@ -1006,15 +1139,112 @@ mod tests {
         );
         // No description in a copybook, so the schema name names the document.
         assert_eq!(document.name, "R");
-        let Some(doc::source_type::Source::Collector(collector)) =
-            document.tables[0].source[0].source.as_ref()
-        else {
-            panic!("the source is a collector attribution");
-        };
-        assert_eq!(collector.model.as_deref(), Some("copybook"));
+        assert_eq!(
+            collector(&document.tables[0].source).model.as_deref(),
+            Some("copybook")
+        );
         let body = document.body.as_ref().unwrap();
         let fields = &body.meta.as_ref().unwrap().custom_fields;
         assert_eq!(custom_string(fields, "ebcdic.layout_source"), "copybook");
+    }
+
+    #[test]
+    fn one_schema_gets_no_heading_and_the_table_still_names_it() {
+        let options = pb::ParseOptions {
+            layout_source: Some(pb::parse_options::LayoutSource::Copybook(
+                "01 R.\n05 CODE PIC X(2).\n".into(),
+            )),
+            ..Default::default()
+        };
+        let document = fold(
+            &options,
+            &Codec::resolve("cp037").unwrap().encode("AB").unwrap(),
+            DocumentFold::new(VERSION),
+        );
+        // Upstream emits a heading only when there is more than one schema,
+        // and there is nothing else to write here: no description, no groups.
+        assert!(document.texts.is_empty(), "{:?}", document.texts);
+        assert!(document.groups.is_empty());
+        assert_eq!(document.tables.len(), 1);
+        assert_eq!(
+            document
+                .body
+                .as_ref()
+                .unwrap()
+                .children
+                .iter()
+                .map(|child| child.r#ref.as_str())
+                .collect::<Vec<_>>(),
+            vec!["#/tables/0"]
+        );
+        // The name docling would have lost with the heading.
+        let fields = &document.tables[0].meta.as_ref().unwrap().custom_fields;
+        assert_eq!(custom_string(fields, "ebcdic.schema"), "R");
+    }
+
+    #[test]
+    fn the_description_opens_the_document_as_a_plain_text_item() {
+        let mut layout = two_schema_layout();
+        layout.records.truncate(1);
+        layout.record_type_field = None;
+        layout.records[0].selector = None;
+        let document = fold(
+            &options(layout),
+            &customer("JANE", [0x12, 0x34, 0x5d])[1..],
+            DocumentFold::new(VERSION),
+        );
+        // One schema, so the only text is the description, and it comes first.
+        assert_eq!(document.texts.len(), 1);
+        assert_eq!(
+            text_label(&document.texts[0]),
+            doc::DocItemLabel::Text as i32
+        );
+        assert_eq!(text_of(&document.texts[0]), "ACCOUNTS EXTRACT");
+        assert_eq!(
+            document
+                .body
+                .as_ref()
+                .unwrap()
+                .children
+                .iter()
+                .map(|child| child.r#ref.as_str())
+                .collect::<Vec<_>>(),
+            vec!["#/texts/0", "#/tables/0"]
+        );
+    }
+
+    #[test]
+    fn a_schema_that_matched_no_record_is_left_out_of_the_document() {
+        // Two schemas declared, only one of them in the input.
+        let document = fold(
+            &options(two_schema_layout()),
+            &customer("JANE", [0x12, 0x34, 0x5d]),
+            DocumentFold::new(VERSION),
+        );
+        assert_eq!(
+            document.tables.len(),
+            1,
+            "an empty schema is not an empty table"
+        );
+        let fields = &document.tables[0].meta.as_ref().unwrap().custom_fields;
+        assert_eq!(custom_string(fields, "ebcdic.schema"), "CUSTOMER");
+        // The heading survives the pruning: the layout still declared two
+        // schemas, so the one table that is here says which one it is.
+        assert_eq!(
+            document.texts.iter().map(text_of).collect::<Vec<_>>(),
+            vec!["ACCOUNTS EXTRACT", "CUSTOMER"]
+        );
+        assert_eq!(
+            document
+                .body
+                .as_ref()
+                .unwrap()
+                .children
+                .iter()
+                .map(|child| child.r#ref.as_str())
+                .collect::<Vec<_>>(),
+            vec!["#/texts/0", "#/texts/1", "#/tables/0"]
+        );
     }
 
     #[test]
@@ -1036,15 +1266,11 @@ mod tests {
         assert!((custom_number(fields, "ebcdic.prefix_size") - 1.0).abs() < f64::EPSILON);
 
         let fields = &document.tables[0].meta.as_ref().unwrap().custom_fields;
+        assert_eq!(custom_string(fields, "ebcdic.schema"), "CUSTOMER");
         assert_eq!(custom_string(fields, "ebcdic.selector"), "C");
         assert!((custom_number(fields, "ebcdic.record_length") - 9.0).abs() < f64::EPSILON);
         assert!((custom_number(fields, "ebcdic.rows") - 1.0).abs() < f64::EPSILON);
         assert!(!fields.contains_key("ebcdic.rows_truncated"));
-
-        // A schema that matched nothing still gets its table and its header.
-        let fields = &document.tables[1].meta.as_ref().unwrap().custom_fields;
-        assert!((custom_number(fields, "ebcdic.rows")).abs() < f64::EPSILON);
-        assert_eq!(document.tables[1].data.as_ref().unwrap().num_rows, 1);
     }
 
     #[test]
@@ -1107,7 +1333,12 @@ mod tests {
         );
         // A table that names a parent which does not list it back is exactly
         // what the coordinator's merge loses without saying so.
-        document.groups[0].children.clear();
+        document
+            .body
+            .as_mut()
+            .unwrap()
+            .children
+            .retain(|child| child.r#ref != "#/tables/0");
         let errors = integrity_errors(&document);
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].contains("does not list"), "{errors:?}");
@@ -1117,8 +1348,16 @@ mod tests {
             &customer("JANE", [0x12, 0x34, 0x5d]),
             DocumentFold::new(VERSION),
         );
-        let first = document.tables[0].self_ref.clone();
-        document.tables[1].self_ref = first;
+        // Two text items with the same self_ref: the description and the
+        // heading are separate items and the merge has to be able to tell
+        // them apart.
+        let first = text_base(&document.texts[0]).self_ref.clone();
+        match document.texts[1].item.as_mut().unwrap() {
+            doc::base_text_item::Item::SectionHeader(heading) => {
+                heading.base.as_mut().unwrap().self_ref = first;
+            }
+            other => panic!("the second text is the schema heading, not {other:?}"),
+        }
         let errors = integrity_errors(&document);
         assert!(
             errors

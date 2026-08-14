@@ -1105,11 +1105,25 @@ async fn the_document_event_arrives_once_immediately_before_the_trailer() {
     assert_eq!(document.schema_name.as_deref(), Some("docling_document_v2"));
     // No description on the copybook, so the schema names the document.
     assert_eq!(document.name, "CUSTOMER-RECORD");
-    assert_eq!(document.groups.len(), 1);
-    assert_eq!(document.groups[0].label, docpb::GroupLabel::Sheet as i32);
+    // The flat docling shape: no groups, and with one schema and no layout
+    // description the table is the whole body.
+    assert!(document.groups.is_empty());
+    assert!(document.texts.is_empty());
     assert_eq!(document.tables.len(), 1);
+    assert_eq!(
+        document
+            .body
+            .as_ref()
+            .unwrap()
+            .children
+            .iter()
+            .map(|child| child.r#ref.as_str())
+            .collect::<Vec<_>>(),
+        vec!["#/tables/0"]
+    );
 
     let table = &document.tables[0];
+    assert_eq!(table.parent.as_ref().unwrap().r#ref, "#/body");
     assert_eq!(
         grid_row(table, 0),
         vec!["CUST-ID", "CUST-NAME", "CUST-BALANCE", "CUST-ORDER-COUNT"],
@@ -1195,8 +1209,14 @@ async fn a_folded_document_carries_the_layout_facts_and_the_row_count() {
 
     let parsed = parse(&client, options, &data).await.unwrap();
     let document = parsed.document.expect("emit_document was set");
-    // The layout's description is a better name than a schema name is.
+    // The layout's description is a better name than a schema name is, and it
+    // also opens the body as a plain text item.
     assert_eq!(document.name, "NIGHTLY EXTRACT");
+    assert_eq!(document.texts.len(), 1);
+    let Some(docpb::base_text_item::Item::Text(opening)) = document.texts[0].item.as_ref() else {
+        panic!("the description is a plain text item");
+    };
+    assert_eq!(opening.base.as_ref().unwrap().text, "NIGHTLY EXTRACT");
 
     let fields = &document
         .body
@@ -1213,6 +1233,7 @@ async fn a_folded_document_carries_the_layout_facts_and_the_row_count() {
     assert!(fields.contains_key("ebcdic.prefix_size"));
 
     let fields = &document.tables[0].meta.as_ref().unwrap().custom_fields;
+    assert!(fields.contains_key("ebcdic.schema"));
     assert!(fields.contains_key("ebcdic.record_length"));
     assert!(fields.contains_key("ebcdic.rows"));
     assert!(

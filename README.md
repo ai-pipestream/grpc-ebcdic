@@ -132,24 +132,35 @@ Set `emit_document` and the server also folds the parse into a single
 lossy structural projection layered on top for callers that want the gRParse
 Document plane straight from the collector.
 
-The mapping is `docs/design.md` §4 made literal, and it lives in
-`src/document_fold.rs`:
+The mapping is `docs/design.md` §4 made literal, it lives in
+`src/document_fold.rs`, and it mirrors the shape docling's own EBCDIC backend
+builds (`docling/backend/ebcdic_backend.py`): a **flat** document with no
+groups at all, everything hanging off `#/body`:
 
-- one `GROUP_LABEL_SHEET` group per record schema, named by the schema, under
-  `#/body`, holding exactly its own table;
+- the layout description, when there is one, opens the document as a `TextItem`
+  labelled `TEXT`;
+- a `SectionHeaderItem` naming each record schema — **only when the layout
+  declares more than one**, as upstream — followed by that schema's
+  `TableItem`, which is the heading's *sibling*, not its child;
+- a schema that matched no record produces nothing: no heading, no empty table;
 - one `TableItem` per schema, its first grid row the field names with
   `column_header = true` — fillers are not columns;
 - one grid row per record, cells aligned by field name; a `Decimal` cell
   carries `Decimal.text` character for character, never re-rendered and never
   a float;
 - `CollectorSource{collector: "ebcdic", model: <proto|json|copybook>, version:
-  <crate version>}` on every table, no `confidence`;
+  <crate version>}` on every item it creates, no `confidence`;
 - no `prov`, no `bbox`, no `origin`, no pages: this stream has byte offsets and
   a layout, not a page and not a filename. The layout facts live in
   `body.meta.custom_fields` (`ebcdic.encoding`, `ebcdic.layout_source`,
   `ebcdic.header_size`, `ebcdic.footer_size`, `ebcdic.prefix_size`) and the
-  per-schema facts in each table's `meta.custom_fields`
-  (`ebcdic.record_length`, `ebcdic.selector`, `ebcdic.rows`).
+  per-schema facts in each table's `meta.custom_fields` (`ebcdic.schema`,
+  `ebcdic.record_length`, `ebcdic.selector`, `ebcdic.rows`).
+
+`ebcdic.schema` is the one addition to the upstream shape: docling names a
+schema only through the heading it emits when there is more than one, so a
+single-schema document loses the name entirely. Every table here says which
+copybook record it holds.
 
 **Use it with a bounded `max_records`.** A Document is one protobuf message and
 a mainframe extract is not: the fold has to hold every row it folds until the
@@ -376,9 +387,11 @@ copybook feature, malformed copybook, multi-schema selectors, header/footer, and
 the two anti-batch stream assertions.
 
 The Document fold has its own: `src/document_fold.rs` drives real events from a
-real walk into the fold and asserts the group/table structure, the header row,
-the exact decimal text, the source stamps, the custom fields, the row cap's
-warning and counter, and — every time — that `integrity_errors` is empty.
+real walk into the fold and asserts the flat body order (description, then
+heading and table per schema), the heading only when there is more than one
+schema, the skipping of a schema that matched no record, the header row, the
+exact decimal text, the source stamps, the custom fields, the row cap's warning
+and counter, and — every time — that `integrity_errors` is empty.
 `tests/parse_stream.rs` proves the wire contract: the event order is exactly
 `layout_info, record…, document, status`, the document arrives once and only
 when asked for, and `emit_document = false` leaves the stream byte-identical to
