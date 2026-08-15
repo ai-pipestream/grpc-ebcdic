@@ -1,4 +1,4 @@
-# grpc-ebcdic — guidelines
+# grpc-ebcdic: guidelines
 
 **This repo:** gRPC collector for copybook-driven EBCDIC records, projecting into the gRParse Document data plane
 
@@ -9,15 +9,15 @@
 # Implementation guidelines
 
 Read this with `AGENTS.md`, `docs/architecture.md`, and `docs/design.md`.
-Architecture wins on *where this sits*. Design wins on *wire shape*.
-This file wins on *how to build it so it matches the fleet*.
+Architecture wins on *where this sits*. Design wins on *wire shape*. This file
+wins on *how to build it so it matches the fleet*.
 
 ## Fleet
 
 These services live under `/work/main/grpc-services`. Each is its own git
-repo. **PipeStream core** (`core-services/*`, engine, repository, frontend)
-is out of scope. **ProtoMolt** is the export sink (markdown/html/parquet);
-it is not this binary.
+repo. **PipeStream core** (`core-services/*`, engine, repository, frontend) is
+out of scope. **ProtoMolt** is the export sink (markdown/html/parquet); it is
+not this binary.
 
 gRParse is the parse coordinator. Format collectors take bytes and stream
 typed events (gRParse maps those into a source-tagged `Document`).
@@ -36,64 +36,62 @@ Sibling implementations to copy from (same workspace):
 
 ## Live stream is the product
 
-Docling convert is batch: one document when everything is finished.
-**We emit the first usable unit the moment it exists** so a UI can paint
-it. `Complete` / `ParseStatus` is a trailer (counts, failures), not the
-payload.
+A batch converter returns one document when everything is finished. **We emit
+the first usable unit the moment it exists** so a UI can paint it. `Complete` /
+`ParseStatus` is a trailer (counts, failures), not the payload.
 
 - Do not buffer the whole parse and then send one message.
 - A unary "return the Document" RPC is optional convenience. UIs use the
   server stream.
 - Events are self-describing (page_no, ref, row index, part id). Clients
   merge. Out-of-order is legal when the design says so (VLM pages).
-- Do not hold item N until item N-1 is ready unless architecture.md
-  requires document order.
+- Do not hold item N until item N-1 is ready unless architecture.md requires
+  document order.
 
 ## Wire
 
-- Binary gRPC. No JSON transcoding on the parse path.
-- **No JSON bridge** for typed data: no `json_format.MessageToDict` /
-  `ParseDict`, no `model_dump_json` round-trips, no stringified JSON
-  blobs as the schema. Preserve types. Use enums + `*_raw` for open
-  vocabularies. `google.protobuf.Value` / `Struct` only where the
-  upstream really is `dict[str, Any]`.
-- Native event stream first (like libreoffice / calamine / POI). Mapping
-  into `ai.pipestream.document.v1.Document` can live here *or* in gRParse;
-  do not invent a parallel JSON document.
-- If you emit Document items, tag `CollectorSource` (`collector`, `model`,
-  optional `confidence`). Sources never overwrite each other.
-- buf v2: lint `STANDARD` + `COMMENTS`, breaking `FILE`. Every field,
-  enum value, and RPC has a comment. `disallow_comment_ignores` when the
-  sibling does.
-- Package: `ai.pipestream.<service>.v1`.
-- Register **gRPC health** (`grpc.health.v1.Health`) and **server
-  reflection**.
+Binary gRPC, with no JSON transcoding on the parse path. There is **no JSON
+bridge** for typed data: no `json_format.MessageToDict` / `ParseDict`, no
+`model_dump_json` round-trips, no stringified JSON blobs as the schema.
+Preserve types. Use enums plus `*_raw` for open vocabularies, and
+`google.protobuf.Value` / `Struct` only where the upstream really is
+`dict[str, Any]`.
+
+The native event stream comes first (like libreoffice / calamine / POI).
+Mapping into `ai.pipestream.document.v1.Document` can live here or in gRParse;
+do not invent a parallel JSON document. If you emit Document items, tag
+`CollectorSource` (`collector`, `model`, optional `confidence`). Sources never
+overwrite each other.
+
+buf v2: lint `STANDARD` + `COMMENTS`, breaking `FILE`. Every field, enum
+value, and RPC has a comment, with `disallow_comment_ignores` when the sibling
+does. The package is `ai.pipestream.<service>.v1`. Register **gRPC health**
+(`grpc.health.v1.Health`) and **server reflection**.
 
 ## Process
 
-- Diskless hot path: request bytes in memory, no durable writes. Image
-  runs `--read-only`. If a library must spill, tmpfs only, documented.
-- Byte cap → `RESOURCE_EXHAUSTED`. Bad / truncated input →
-  `INVALID_ARGUMENT`. Wrong format → `UNIMPLEMENTED`. Parser crash →
+- Diskless hot path: request bytes in memory, no durable writes. Image runs
+  `--read-only`. If a library must spill, tmpfs only, documented.
+- Byte cap gives `RESOURCE_EXHAUSTED`. Bad or truncated input gives
+  `INVALID_ARGUMENT`. Wrong format gives `UNIMPLEMENTED`. Parser crash gives
   `INTERNAL`. A failed collector is an error entry, not a process abort.
 - Bound concurrency (heap or VRAM), not "as many as requests."
-- Metrics line on an interval + optional Prometheus port, same idea as
+- Metrics line on an interval plus optional Prometheus port, same idea as
   gRParse / grPOIc.
-- Dockerfile: build tests in the image build; runtime has no shell
-  requirement if the fleet sibling doesn't.
+- Dockerfile: build tests in the image build; runtime has no shell requirement
+  if the fleet sibling doesn't.
 
 ## Tests
 
-- In-memory fixtures authored by the test (or tiny generated bytes).
-  Do not commit customer documents or huge binaries.
-- Assert the stream: first event arrives before the upload is finished
-  when the design requires it (see `grpc-lol-html` /
-  `grpc-calamine`).
-- Golden tests compare labels + text + ordering, not full protobuf
-  equality of unknown fields.
+- In-memory fixtures authored by the test (or tiny generated bytes). Do not
+  commit customer documents or huge binaries.
+- Assert the stream: first event arrives before the upload is finished when
+  the design requires it (see `grpc-lol-html` / `grpc-calamine`).
+- Golden tests compare labels + text + ordering, not full protobuf equality of
+  unknown fields.
 - No network in unit tests. Fake the VLM HTTP endpoint for enrich /
-  vlm-convert. XXE/zip-bomb/truncated-input cases are mandatory where
-  the format can express them.
+  vlm-convert. XXE/zip-bomb/truncated-input cases are mandatory where the
+  format can express them.
 
 ## Git
 
@@ -108,8 +106,8 @@ payload.
 
 - PipeStream engine, repository-service, frontend BFF.
 - Implementing the protomolt sink.
-- PyTorch / transformers / mlx in *this* process (VLM weights are a
-  *server this client calls*).
+- PyTorch / transformers / mlx in *this* process (VLM weights are a *server
+  this client calls*).
 - Downloading Hugging Face weights at RPC time.
 - Changing gRParse in the same PR unless you are wiring the collector
-  endpoint — prefer a complete service here first.
+  endpoint: prefer a complete service here first.

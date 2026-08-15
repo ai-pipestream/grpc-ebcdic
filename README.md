@@ -6,15 +6,11 @@ Document data plane.
 An `.ebc` file carries no self-describing structure. It is a run of fixed-width
 records whose fields only mean something together with the COBOL copybook that
 produced them, and without that copybook the bytes are an opaque code page.
-This service takes the bytes **and** the layout, and streams one typed row per
+This service takes the bytes and the layout, and streams one typed row per
 record as the byte walk progresses.
 
-It is not PipeStream core and not a Docling Python wrapper. The layout model,
-the decoders, and the record-selection rules mirror Docling's
-`EbcdicDocumentBackend` field for field, so the same bytes and the same layout
-produce the same values through either implementation. What differs is the
-delivery: Docling returns one finished document, and this streams rows as they
-decode.
+Rows are typed. Packed and zoned decimals stay decimal, binary fields stay
+integers, and no value crosses the wire as a float or a JSON blob.
 
 ---
 
@@ -22,7 +18,7 @@ decode.
 
 ```bash
 cargo build --release          # protoc is the only non-Rust build dependency
-cargo test                     # 92 tests, no network, no fixture files
+cargo test                     # 95 tests, no network, no fixture files
 cargo clippy --all-targets     # pedantic, clean
 buf lint                       # STANDARD + COMMENTS, no comment ignores
 ./target/release/grpc-ebcdic   # listens on 0.0.0.0:50051
@@ -37,7 +33,7 @@ docker run --rm --read-only --cap-drop=ALL -p 50051:50051 grpc-ebcdic
 
 The image is multi-stage; `cargo test` runs inside the build stage and gates
 it. The runtime stage is Debian slim, runs as uid 10001, and needs no writable
-filesystem — record bytes never leave memory.
+filesystem: record bytes never leave memory.
 
 Poke it with `grpcurl` (server reflection is registered, so no local protos are
 needed):
@@ -72,6 +68,20 @@ rpc GetServiceInfo(GetServiceInfoRequest) returns (GetServiceInfoResponse);
 | n+1 | `document` | only when `emit_document` was set; immediately before the trailer |
 | last | `status` | once the request stream ends |
 
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as grpc-ebcdic
+    C->>S: options (layout, encoding)
+    S-->>C: layout_info
+    loop until upload ends
+        C->>S: chunk (file bytes)
+        S-->>C: record, one per decoded record
+    end
+    S-->>C: document (only when emit_document)
+    S-->>C: status trailer
+```
+
 Rows are never batched, never reordered, and never held back. Records are
 fixed-length, so "this record is complete" is a property of the bytes and not of
 the upload finishing: send the first record and hold the stream open and the row
@@ -90,9 +100,9 @@ Set on the first frame. Exactly one layout form is required.
 | Field | Default | Meaning |
 |---|---|---|
 | `encoding` | `cp037` | EBCDIC code page for character data |
-| `layout` | — | `EbcdicLayout` protobuf; the canonical form |
-| `layout_json` | — | Docling's `EbcdicLayout` JSON, parsed in process |
-| `copybook` | — | COBOL copybook source, compiled in process |
+| `layout` | one of three required | `EbcdicLayout` protobuf; the canonical form |
+| `layout_json` | one of three required | the same `EbcdicLayout` model as JSON bytes, parsed in process |
+| `copybook` | one of three required | COBOL copybook source, compiled in process |
 | `max_records` | `0` (all) | stop after this many records |
 | `strip_control_characters` | `true` | drop Unicode control characters from text |
 | `abort_on_error` | `false` | refuse a trailing partial record instead of warning |
@@ -103,7 +113,7 @@ The three layout forms are a protobuf `oneof`, so "both" cannot be expressed on
 the wire. Sending none of them is `INVALID_ARGUMENT`: the bytes are meaningless
 without a layout and the server refuses to guess one.
 
-Layouts are **always** part of the request. There is no server filesystem path,
+Layouts are always part of the request. There is no server filesystem path,
 ever.
 
 ### Values on the wire
@@ -127,55 +137,51 @@ field a client can always trust.
 
 Set `emit_document` and the server also folds the parse into a single
 `ai.pipestream.document.v1.Document` and sends it as the `document` event,
-**once, immediately before `status`**. The row stream is unchanged: the
-`record` events are still the complete, lossless result, and the Document is a
-lossy structural projection layered on top for callers that want the gRParse
-Document plane straight from the collector.
+once, immediately before `status`. The row stream is unchanged: the `record`
+events are still the complete, lossless result, and the Document is a lossy
+structural projection layered on top for callers that want the gRParse Document
+plane straight from the collector.
 
-The mapping is `docs/design.md` §4 made literal, it lives in
-`src/document_fold.rs`, and it mirrors the shape docling's own EBCDIC backend
-builds (`docling/backend/ebcdic_backend.py`): a **flat** document with no
-groups at all, everything hanging off `#/body`:
+The mapping is `docs/design.md` §4 made literal and lives in
+`src/document_fold.rs`. The document is flat: no groups at all, everything
+hanging off `#/body`. The layout description, when there is one, opens the
+document as a `TextItem` labelled `TEXT`. Each record schema gets a
+`SectionHeaderItem`, but only when the layout declares more than one schema,
+followed by that schema's `TableItem`, which is the heading's sibling, not its
+child. A schema that matched no record produces nothing: no heading, no empty
+table. Each `TableItem` puts the field names in its first grid row with
+`column_header = true`, and fillers are not columns. Every further grid row is
+one record, cells aligned by field name; a `Decimal` cell carries `Decimal.text`
+character for character, never re-rendered and never a float.
 
-- the layout description, when there is one, opens the document as a `TextItem`
-  labelled `TEXT`;
-- a `SectionHeaderItem` naming each record schema — **only when the layout
-  declares more than one**, as upstream — followed by that schema's
-  `TableItem`, which is the heading's *sibling*, not its child;
-- a schema that matched no record produces nothing: no heading, no empty table;
-- one `TableItem` per schema, its first grid row the field names with
-  `column_header = true` — fillers are not columns;
-- one grid row per record, cells aligned by field name; a `Decimal` cell
-  carries `Decimal.text` character for character, never re-rendered and never
-  a float;
-- `CollectorSource{collector: "ebcdic", model: <proto|json|copybook>, version:
-  <crate version>}` on every item it creates, no `confidence`;
-- no `prov`, no `bbox`, no `origin`, no pages: this stream has byte offsets and
-  a layout, not a page and not a filename. The layout facts live in
-  `body.meta.custom_fields` (`ebcdic.encoding`, `ebcdic.layout_source`,
-  `ebcdic.header_size`, `ebcdic.footer_size`, `ebcdic.prefix_size`) and the
-  per-schema facts in each table's `meta.custom_fields` (`ebcdic.schema`,
-  `ebcdic.record_length`, `ebcdic.selector`, `ebcdic.rows`).
+Every item the fold creates carries
+`CollectorSource{collector: "ebcdic", model: <proto|json|copybook>, version:
+<crate version>}` and no `confidence`. There is no `prov`, no `bbox`, no
+`origin`, and no pages: this stream has byte offsets and a layout, not a page
+and not a filename. The layout facts live in `body.meta.custom_fields`
+(`ebcdic.encoding`, `ebcdic.layout_source`, `ebcdic.header_size`,
+`ebcdic.footer_size`, `ebcdic.prefix_size`) and the per-schema facts in each
+table's `meta.custom_fields` (`ebcdic.schema`, `ebcdic.record_length`,
+`ebcdic.selector`, `ebcdic.rows`).
 
-`ebcdic.schema` is the one addition to the upstream shape: docling names a
-schema only through the heading it emits when there is more than one, so a
-single-schema document loses the name entirely. Every table here says which
-copybook record it holds.
+`ebcdic.schema` deserves a note. A heading names a schema only when the layout
+has more than one, so a single-schema document would lose the name entirely.
+Every table here says which copybook record it holds, heading or not.
 
 **Use it with a bounded `max_records`.** A Document is one protobuf message and
 a mainframe extract is not: the fold has to hold every row it folds until the
 parse ends, which is the exact opposite of what the row stream exists for. The
-fold therefore caps itself at **100 000 rows per record schema**. Rows past the
-cap are counted, not folded, and the trailer carries a
+fold therefore caps itself at 100,000 rows per record schema. Rows past the cap
+are counted, not folded, and the trailer carries a
 `WARNING_CODE_DOCUMENT_ROWS_TRUNCATED` warning naming the schema, the dropped
-count, and the byte offset of the first dropped record — with the same count in
+count, and the byte offset of the first dropped record, with the same count in
 that table's `meta.custom_fields["ebcdic.rows_truncated"]`. Nothing is capped
 silently. A caller who wants a whole Document sets `max_records` below the cap;
 a caller who wants every row reads the `record` events, which are never capped.
 
 `document_fold::integrity_errors` checks that the fragment is safe for the
-coordinator's additive merge — unique `self_ref`, symmetric parent/child links,
-no dangling refs — and every fold test asserts it comes back empty.
+coordinator's additive merge (unique `self_ref`, symmetric parent/child links,
+no dangling refs), and every fold test asserts it comes back empty.
 
 ### Errors
 
@@ -190,7 +196,7 @@ no dangling refs — and every fold test asserts it comes back empty.
 | Input past the byte cap; more parses in flight than admitted | `RESOURCE_EXHAUSTED` |
 | Server fault | `INTERNAL` |
 
-A trailing partial record is a **warning** in the trailer, not a failure, unless
+A trailing partial record is a warning in the trailer, not a failure, unless
 `abort_on_error` is set. Field-level corruption is always fatal regardless of
 that flag: a packed field with a bad nibble has no value to report, and
 inventing one is how a balance comes back wrong.
@@ -221,7 +227,7 @@ record:
 | `CUST-NAME` | 6 | 20 | string | 0 |
 | `CUST-BALANCE` | 26 | 5 | packed decimal | 2 |
 | `CUST-ORDER-COUNT` | 31 | 2 | integer | 0 |
-| *(filler)* | 33 | 4 | skip | — |
+| *(filler)* | 33 | 4 | skip | n/a |
 
 One record holding id `1`, name `ACME SUPPLY`, balance `-12345.67`, and `42`
 orders is these 37 bytes in cp037:
@@ -267,18 +273,18 @@ The `copybook` option compiles the flat subset of COBOL data descriptions that a
 record layout is made of. It is not a COBOL compiler: there is no
 `PROCEDURE DIVISION`, no `COPY ... REPLACING`, and no attempt to be clever.
 Anything outside the subset is `UNIMPLEMENTED` and names the clause that did it,
-so a caller finds out their copybook needs hand-normalizing *before* they ship
-it rather than after a table of garbage arrives.
+so a caller finds out their copybook needs hand-normalizing before they ship it
+rather than after a table of garbage arrives.
 
-**Supported:** levels 01–49 and 77 (88 condition names are skipped as
-storage-free); group items nested to any depth, flattened to leaves; `PIC X`/`A`
-character items; `PIC 9` numerics with a leading `S` and one `V`; `USAGE
-DISPLAY`, `COMP-3`/`PACKED-DECIMAL`, `COMP`/`COMP-4`/`BINARY`; `OCCURS n` on an
-elementary item, expanded to `NAME(1)`…`NAME(n)`; `FILLER` and anonymous items;
-byte-neutral clauses (`VALUE`, `JUSTIFIED`, `BLANK WHEN ZERO`, `GLOBAL`,
-`EXTERNAL`); both fixed-format card columns and free format.
+Supported: levels 01 through 49 and 77 (88 condition names are skipped as
+storage-free), group items nested to any depth and flattened to leaves, `PIC
+X`/`A` character items, `PIC 9` numerics with a leading `S` and one `V`, `USAGE
+DISPLAY`, `COMP-3`/`PACKED-DECIMAL`, `COMP`/`COMP-4`/`BINARY`, `OCCURS n` on an
+elementary item expanded to `NAME(1)` through `NAME(n)`, `FILLER` and anonymous
+items, the byte-neutral clauses (`VALUE`, `JUSTIFIED`, `BLANK WHEN ZERO`,
+`GLOBAL`, `EXTERNAL`), and both fixed-format card columns and free format.
 
-**Refused, with the reason:** `REDEFINES`, level-66 `RENAMES`, `OCCURS DEPENDING
+Refused, with the reason: `REDEFINES`, level-66 `RENAMES`, `OCCURS DEPENDING
 ON`, `COMP-1`/`COMP-2` (hex float), `COMP-5` (native endianness), `SYNCHRONIZED`
 (compiler-chosen slack bytes), explicit `SIGN` clauses, `POINTER`/`INDEX`,
 numeric-edited and alphanumeric-edited pictures, `P` scaling, `OCCURS` on a
@@ -291,35 +297,34 @@ express. Use `ParseOptions.layout` for those; see
 
 ## Multi-schema and variable-length files
 
-`EbcdicLayout` mirrors Docling's model, including the two optional prefix fields
-read ahead of every record:
-
-- `record_type_field` — its decoded value is matched against each schema's
-  `selector`. Required as soon as a layout has more than one schema; selectors
-  must be unique, and a record whose type matches nothing is
-  `INVALID_ARGUMENT` (the walk cannot know how many bytes to skip).
-- `record_length_field` — the total record length, prefix included. Set it for
-  variable-length records. The declared length may exceed the schema's extent
-  (the surplus is inter-record slack and is skipped); a length shorter than the
-  schema is refused.
+`EbcdicLayout` carries two optional prefix fields read ahead of every record.
+`record_type_field` is decoded and matched against each schema's `selector`. It
+is required as soon as a layout has more than one schema; selectors must be
+unique, and a record whose type matches nothing is `INVALID_ARGUMENT` because
+the walk cannot know how many bytes to skip. `record_length_field` holds the
+total record length, prefix included; set it for variable-length records. The
+declared length may exceed the schema's extent (the surplus is inter-record
+slack and is skipped), while a length shorter than the schema is refused.
 
 `header_size` and `footer_size` bytes are skipped at the boundaries. The footer
-is held back incrementally — any byte more than `footer_size` from the
-high-water mark is definitely data — so a layout with a footer still streams
+is held back incrementally (any byte more than `footer_size` from the
+high-water mark is definitely data), so a layout with a footer still streams
 rather than buffering the file.
 
 ## Code pages
 
 This build carries `cp037` (US/Canada, the default), `cp273`, `cp424`, `cp500`
-(international), `cp875`, `cp1026`, and `cp1140` (cp037 with the euro at `0x9f`).
-Names resolve through the usual aliases (`IBM-037`, `037`, `ebcdic-cp-us`, …).
-An unknown name is `INVALID_ARGUMENT` and lists what is available.
+(international), `cp875`, `cp1026`, and `cp1140` (cp037 with the euro at
+`0x9f`). Names resolve through the usual aliases (`IBM-037`, `037`,
+`ebcdic-cp-us`, and friends). An unknown name is `INVALID_ARGUMENT` and lists
+what is available.
 
 The tables in `src/codepages.rs` are generated from the Python standard library
-codecs of the same name — which is what Docling decodes with — so the two agree
-byte for byte. Decoding is strict: a byte the code page leaves unassigned is an
+codecs of the same name, so decoding matches the reference Python codecs byte
+for byte. Decoding is strict: a byte the code page leaves unassigned is an
 error, not a U+FFFD, because silently substituting a replacement character into
-an account number is worse than refusing the record. Regenerate the tables with:
+an account number is worse than refusing the record. Regenerate the tables
+with:
 
 ```bash
 python3 - <<'EOF' > /tmp/tables.rs
@@ -374,7 +379,7 @@ grpc-ebcdic metrics: parses{started=12,completed=11,failed=1,rejected=0} records
 cargo test
 ```
 
-92 tests, none of which touch the network beyond localhost or the disk at all.
+95 tests, none of which touch the network beyond localhost or the disk at all.
 There are no fixture files: every record is assembled in the test from a
 copybook written as a string literal plus an EBCDIC encoder that writes zoned,
 packed, and binary fields from the COBOL definitions. A round trip is therefore
@@ -391,9 +396,9 @@ real walk into the fold and asserts the flat body order (description, then
 heading and table per schema), the heading only when there is more than one
 schema, the skipping of a schema that matched no record, the header row, the
 exact decimal text, the source stamps, the custom fields, the row cap's warning
-and counter, and — every time — that `integrity_errors` is empty.
+and counter, and, every time, that `integrity_errors` is empty.
 `tests/parse_stream.rs` proves the wire contract: the event order is exactly
-`layout_info, record…, document, status`, the document arrives once and only
+`layout_info, record..., document, status`, the document arrives once and only
 when asked for, and `emit_document = false` leaves the stream byte-identical to
 what it always was.
 
@@ -401,40 +406,44 @@ what it always was.
 
 ## Docs
 
-- [Architecture](docs/architecture.md) — where this sits in the collector fleet
-- [Design](docs/design.md) — wire API, Document mapping, tests
-- [Guidelines](docs/guidelines.md) — how to build it so it matches the fleet
-- [`AGENTS.md`](AGENTS.md) — read order, definition of done, git
+- [Architecture](docs/architecture.md): where this sits in the collector fleet
+- [Design](docs/design.md): wire API, Document mapping, tests
+- [Guidelines](docs/guidelines.md): how to build it so it matches the fleet
+- [`AGENTS.md`](AGENTS.md): read order, definition of done, git
 
 ### Where the implementation departs from `docs/design.md`
 
-- **Event types are named `*Response`.** `design.md` §3 sketches
-  `ParseEbcdicEvent`; buf's `STANDARD` lint requires an RPC's response type to
-  be `<RpcName>Response`, so the oneof lives inside `ParseEbcdicResponse`.
-- **The layout mirrors Docling's real model.** `design.md` §5 sketches
-  `offset`/`length` per field; Docling's `EbcdicField` actually carries `size`
-  with offsets implied by physical order. Since §5 says "mirror Docling's
-  `EbcdicField`", the real model wins. `offset` is accepted as an optional
-  cross-check that can declare a gap but never an overlap, which is what makes
-  §5's "overlapping fields → `INVALID_ARGUMENT`" a rule with something to check.
-- **A copybook compiler exists.** `design.md` §2 makes "compiling arbitrary
-  COBOL source" a v1 non-goal. The compiler here is not that: it handles the
-  flat `level / name / PIC / USAGE` subset and refuses everything else by name.
-  It is additive — the protobuf and JSON layout forms are unchanged and remain
-  canonical — and it is what gives the fleet's `UNIMPLEMENTED`-for-unsupported-
-  copybook-feature rule something to be about. See `src/copybook.rs`.
-- **A trailing partial record warns; a short field does not.** `design.md` §6
-  asks for the warning, and Docling raises instead. Where Docling silently
-  truncates a field whose bytes run past the end of a length-prefixed record,
-  this build refuses.
-- **The `Document` mapping is opt-in and bounded.** `design.md` §4 describes one
-  `TableItem` per record schema and is now implemented here, behind
-  `emit_document`. §4 also argued that streaming rows is what keeps a 10 M-row
-  dump from inflating one event, and that argument still stands: the fold is off
-  by default, and when it is on it caps itself per schema and reports what it
-  dropped rather than pretending a Document can hold an extract. gRParse
-  *wiring* (the `COLLECTOR_*` enum, the endpoint) remains the follow-up
-  `AGENTS.md` describes.
+**Event types are named `*Response`.** `design.md` §3 sketches
+`ParseEbcdicEvent`; buf's `STANDARD` lint requires an RPC's response type to be
+`<RpcName>Response`, so the oneof lives inside `ParseEbcdicResponse`.
+
+**Fields carry `size`, not `offset`/`length`.** `design.md` §5 sketches
+`offset`/`length` per field; the layout model this service implements carries
+`size` with offsets implied by physical record order. `offset` is accepted as
+an optional cross-check that can declare a gap but never an overlap, which is
+what makes §5's "overlapping fields are `INVALID_ARGUMENT`" a rule with
+something to check.
+
+**A copybook compiler exists.** `design.md` §2 makes "compiling arbitrary COBOL
+source" a v1 non-goal. The compiler here is not that: it handles the flat
+`level / name / PIC / USAGE` subset and refuses everything else by name. It is
+additive (the protobuf and JSON layout forms are unchanged and remain
+canonical), and it is what gives the fleet's
+`UNIMPLEMENTED`-for-unsupported-copybook-feature rule something to be about. See
+`src/copybook.rs`.
+
+**A trailing partial record warns; a short field does not.** `design.md` §6
+asks for the warning. This build also refuses a field whose bytes run past the
+end of a length-prefixed record rather than silently truncating it.
+
+**The `Document` mapping is opt-in and bounded.** `design.md` §4 describes one
+`TableItem` per record schema and is now implemented here, behind
+`emit_document`. §4 also argued that streaming rows is what keeps a 10 M-row
+dump from inflating one event, and that argument still stands: the fold is off
+by default, and when it is on it caps itself per schema and reports what it
+dropped rather than pretending a Document can hold an extract. gRParse wiring
+(the `COLLECTOR_*` enum, the endpoint) remains the follow-up `AGENTS.md`
+describes.
 
 ---
 
