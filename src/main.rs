@@ -4,7 +4,7 @@
 //!
 //! Every knob is an environment variable, all optional:
 //!
-//! - `GRPC_EBCDIC_ADDR` — listen address (default `0.0.0.0:50051`).
+//! - `GRPC_EBCDIC_ADDR` — listen address (default `0.0.0.0:50063`).
 //! - `GRPC_EBCDIC_WORKERS` — tokio worker threads (default: CPU count).
 //! - `GRPC_EBCDIC_MAX_DOCUMENT_MIB` — byte cap per parse when the request does
 //!   not set one (default 512). Exceeding it is `RESOURCE_EXHAUSTED`.
@@ -36,7 +36,7 @@ const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default listen address when `GRPC_EBCDIC_ADDR` is not set.
-const DEFAULT_ADDR: &str = "0.0.0.0:50051";
+const DEFAULT_ADDR: &str = "0.0.0.0:50063";
 
 /// Default HTTP/2 initial window, for both the stream and the connection.
 const DEFAULT_WINDOW_BYTES: u32 = 16 * 1024 * 1024;

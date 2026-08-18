@@ -21,14 +21,14 @@ cargo build --release          # protoc is the only non-Rust build dependency
 cargo test                     # 95 tests, no network, no fixture files
 cargo clippy --all-targets     # pedantic, clean
 buf lint                       # STANDARD + COMMENTS, no comment ignores
-./target/release/grpc-ebcdic   # listens on 0.0.0.0:50051
+./target/release/grpc-ebcdic   # listens on 0.0.0.0:50063
 ```
 
 Container:
 
 ```bash
 docker build -t grpc-ebcdic .
-docker run --rm --read-only --cap-drop=ALL -p 50051:50051 grpc-ebcdic
+docker run --rm --read-only --cap-drop=ALL -p 50063:50063 grpc-ebcdic
 ```
 
 The image is multi-stage; `cargo test` runs inside the build stage and gates
@@ -39,9 +39,9 @@ Poke it with `grpcurl` (server reflection is registered, so no local protos are
 needed):
 
 ```bash
-grpcurl -plaintext localhost:50051 list
-grpcurl -plaintext localhost:50051 ai.pipestream.ebcdic.v1.EbcdicParseService/GetServiceInfo
-grpcurl -plaintext localhost:50051 grpc.health.v1.Health/Check
+grpcurl -plaintext localhost:50063 list
+grpcurl -plaintext localhost:50063 ai.pipestream.ebcdic.v1.EbcdicParseService/GetServiceInfo
+grpcurl -plaintext localhost:50063 grpc.health.v1.Health/Check
 ```
 
 ---
@@ -355,7 +355,7 @@ All optional; see `src/main.rs`.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `GRPC_EBCDIC_ADDR` | `0.0.0.0:50051` | listen address |
+| `GRPC_EBCDIC_ADDR` | `0.0.0.0:50063` | listen address |
 | `GRPC_EBCDIC_WORKERS` | CPU count | tokio worker threads |
 | `GRPC_EBCDIC_MAX_DOCUMENT_MIB` | `512` | byte cap when the request sets none |
 | `GRPC_EBCDIC_MAX_CONCURRENT_PARSES` | `64` | parses admitted at once; past it, refused not queued |

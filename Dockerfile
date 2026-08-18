@@ -12,7 +12,7 @@
 # `--read-only` and no writable volume:
 #
 #   docker build -t grpc-ebcdic .
-#   docker run --rm --read-only --cap-drop=ALL -p 50051:50051 grpc-ebcdic
+#   docker run --rm --read-only --cap-drop=ALL -p 50063:50063 grpc-ebcdic
 
 FROM rust:1.97-slim-trixie AS build
 
@@ -58,10 +58,10 @@ RUN set -eux; \
 COPY --from=build /src/target/release/grpc-ebcdic /usr/local/bin/grpc-ebcdic
 
 USER 10001:10001
-EXPOSE 50051
+EXPOSE 50063
 
 # See src/main.rs for the full list; these are the ones worth defaulting.
-ENV GRPC_EBCDIC_ADDR=0.0.0.0:50051 \
+ENV GRPC_EBCDIC_ADDR=0.0.0.0:50063 \
     GRPC_EBCDIC_MAX_DOCUMENT_MIB=512 \
     GRPC_EBCDIC_MAX_CONCURRENT_PARSES=64 \
     GRPC_EBCDIC_METRICS_INTERVAL_SECONDS=60
