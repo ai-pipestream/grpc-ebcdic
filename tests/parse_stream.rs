@@ -922,6 +922,10 @@ async fn get_service_info_reports_what_this_build_can_do() {
             .contains(&(pb::FieldType::PackedDecimal as i32))
     );
     assert!(!info.version.is_empty());
+    let ui = info.ui.expect("the demo shell reads ui to build its tab bar");
+    assert_eq!(ui.title, "EBCDIC");
+    assert_eq!(ui.path, "/ui/ebcdic");
+    assert!(!ui.description.is_empty());
 }
 
 #[tokio::test]

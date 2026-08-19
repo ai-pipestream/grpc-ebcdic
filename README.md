@@ -56,6 +56,9 @@ rpc ParseEbcdic(stream ParseEbcdicRequest) returns (stream ParseEbcdicResponse);
 rpc GetServiceInfo(GetServiceInfoRequest) returns (GetServiceInfoResponse);
 ```
 
+`GetServiceInfoResponse.ui` carries the shared-shell `UiInfo` advertisement
+(title, mount path, tooltip) every ai-pipestream service exposes.
+
 ### The stream
 
 `ParseEbcdic` is bidirectional. The client sends one `options` frame and then

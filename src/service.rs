@@ -221,6 +221,12 @@ impl EbcdicParseService for EbcdicGrpc {
                 pb::FieldType::Skip as i32,
             ],
             copybook_compiler: true,
+            ui: Some(pb::UiInfo {
+                title: "EBCDIC".to_string(),
+                path: "/ui/ebcdic".to_string(),
+                description: "EBCDIC fixed-width mainframe data to the document data plane"
+                    .to_string(),
+            }),
         }))
     }
 }

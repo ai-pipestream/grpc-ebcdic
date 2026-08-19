@@ -125,4 +125,20 @@ message GetServiceInfoResponse {
 
   // Whether this build compiles `ParseOptions.copybook` COBOL source.
   bool copybook_compiler = 8;
+
+  // Frontend advertisement for the shared demo shell.
+  UiInfo ui = 9;
+}
+
+// Frontend advertisement. Same shape in every ai-pipestream grpc service:
+// the demo shell reads it to build its tab bar.
+message UiInfo {
+  // Tab title, for example "EBCDIC".
+  string title = 1;
+
+  // Shell mount path, for example "/ui/ebcdic".
+  string path = 2;
+
+  // One line, used as the tab tooltip.
+  string description = 3;
 }
