@@ -6,21 +6,26 @@
 # path to a runnable artifact that skips `cargo test`, because a decoder that
 # is wrong about a sign nibble is worse than one that does not ship.
 #
-# The runtime stage is Debian slim with no shell needed for operation, no
-# package manager left behind, and a non-root user. The service is diskless —
+# The runtime stage is Docker Hardened Images debian-base: glibc and libgcc,
+# no package manager, signed provenance, and uid 65532 non-root out of the
+# box. The service is diskless —
 # record bytes never leave memory — so the container runs happily with
 # `--read-only` and no writable volume:
 #
 #   docker build -t grpc-ebcdic .
 #   docker run --rm --read-only --cap-drop=ALL -p 50063:50063 grpc-ebcdic
 
-FROM rust:1.97-slim-trixie AS build
+FROM dhi.io/rust:1-dev AS build
+
+# The dev variant of the hardened toolchain image: it carries apt (needed for
+# protoc below) and runs as root, where the plain dhi.io/rust:1 runtime-style
+# image has no package manager at all.
 
 # protoc is the only build dependency beyond the Rust toolchain: build.rs
 # drives tonic-prost-build, which shells out to it.
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends protobuf-compiler; \
+    apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev; \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -46,18 +51,11 @@ RUN cargo test --locked --release --all-targets
 RUN cargo build --locked --release --bin grpc-ebcdic \
     && strip target/release/grpc-ebcdic
 
-FROM debian:trixie-slim
-
-# A system account with no login shell and no home directory to write into.
-RUN set -eux; \
-    groupadd --system --gid 10001 ebcdic; \
-    useradd --system --uid 10001 --gid ebcdic \
-        --home-dir /nonexistent --no-create-home \
-        --shell /usr/sbin/nologin ebcdic
+FROM dhi.io/debian-base:trixie-debian13
 
 COPY --from=build /src/target/release/grpc-ebcdic /usr/local/bin/grpc-ebcdic
 
-USER 10001:10001
+USER nonroot
 EXPOSE 50063
 
 # See src/main.rs for the full list; these are the ones worth defaulting.
