@@ -1,0 +1,523 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>grpc-ebcdic: watch records decode</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfd;      --panel: #fff;    --ink: #16181d;   --dim: #6a7080;
+    --line: #e2e5ec;    --accent: #2f6df6; --live: #12a150; --warn: #d1442f;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1014;    --panel: #171a21; --ink: #e6e8ee;   --dim: #949bab;
+      --line: #262b36;  --accent: #6b9bff; --live: #37d67a; --warn: #ff7a63;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header { padding: 24px 24px 8px; }
+  h1 { margin: 0; font-size: 20px; letter-spacing: -.01em; }
+  h1 code { font: 600 19px/1 var(--mono); color: var(--accent); }
+  .sub { margin: 6px 0 0; color: var(--dim); max-width: 62ch; }
+  main { padding: 16px 24px 40px; display: grid; gap: 16px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 14px 16px;
+  }
+  .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+  label { display: block; font-size: 12px; color: var(--dim); margin-bottom: 4px; }
+  select, input[type=text] {
+    font: 13px var(--mono); padding: 7px 9px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+  }
+  textarea {
+    width: 100%; min-height: 150px; resize: vertical;
+    font: 12.5px/1.5 var(--mono); padding: 9px 11px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+  }
+  button {
+    font: 600 13px system-ui; padding: 8px 16px; border-radius: 7px; border: 0;
+    background: var(--accent); color: #fff; cursor: pointer;
+  }
+  button:disabled { opacity: .45; cursor: default; }
+  .throttle { display: flex; align-items: center; gap: 8px; }
+  .throttle input { width: 130px; }
+  .hint { font-size: 12px; color: var(--dim); }
+  .check { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+
+  /* Upload bar with a marker where the first row landed. */
+  .track {
+    position: relative; height: 26px; border-radius: 6px;
+    background: var(--bg); border: 1px solid var(--line); overflow: hidden;
+  }
+  .fill { height: 100%; width: 0; background: var(--accent); opacity: .22; transition: width .08s linear; }
+  .mark { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--live); display: none; }
+  .track-label {
+    position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: space-between; padding: 0 10px;
+    font: 11px var(--mono); color: var(--dim);
+  }
+  .verdict { margin-top: 10px; font-size: 14px; }
+  .verdict strong { color: var(--live); }
+  .verdict.idle { color: var(--dim); }
+
+  .stats { display: flex; flex-wrap: wrap; gap: 22px; }
+  .stat b { display: block; font: 600 20px/1.2 var(--mono); }
+  .stat span { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
+
+  .layout { font: 12px/1.6 var(--mono); color: var(--dim); overflow-x: auto; white-space: pre; }
+
+  .tables { display: grid; gap: 16px; }
+  .table-wrap { max-height: 46vh; overflow-y: auto; }
+  .table-title { font: 600 13px var(--mono); margin-bottom: 8px; }
+  .table-title .meta { color: var(--dim); font-weight: 400; }
+  table { width: 100%; border-collapse: collapse; font: 12.5px var(--mono); }
+  th {
+    text-align: left; font-weight: 600; color: var(--dim); padding-bottom: 6px;
+    position: sticky; top: 0; background: var(--panel);
+  }
+  th.n, td.n { text-align: right; }
+  td { padding: 2px 8px 2px 0; border-top: 1px solid var(--line); }
+  tr.new td { animation: flash .5s ease-out; }
+  @keyframes flash { from { background: color-mix(in srgb, var(--live) 26%, transparent); } }
+  td.idx { color: var(--dim); }
+  td.neg { color: var(--warn); }
+
+  .log { font: 12.5px/1.65 var(--mono); }
+  .log .k { color: var(--dim); }
+  .log .err { color: var(--warn); font-weight: 600; }
+  .log .ok { color: var(--live); }
+  footer { padding: 0 24px 32px; color: var(--dim); font-size: 12.5px; max-width: 74ch; }
+  footer code { font-family: var(--mono); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Watching <code>grpc-ebcdic</code> decode</h1>
+  <p class="sub">
+    One HTTP request carries the file up while decoded rows come back down, the
+    same shape as the gRPC call underneath. A row lands the moment its record's
+    last byte arrives, which is why rows show up before the upload bar fills.
+    Slow the upload to watch it happen.
+  </p>
+</header>
+
+<main>
+  <div class="panel controls">
+    <div>
+      <label for="sample">File</label>
+      <select id="sample"></select>
+    </div>
+    <div>
+      <label for="pick">…or a local file</label>
+      <input id="pick" type="file" accept=".ebc,.dat,.bin,application/octet-stream">
+    </div>
+    <div>
+      <label for="encoding">Code page</label>
+      <select id="encoding"></select>
+    </div>
+    <div class="throttle">
+      <div>
+        <label for="delay">Upload throttle</label>
+        <input id="delay" type="range" min="0" max="120" step="10" value="40">
+      </div>
+      <span class="hint"><span id="delayLabel">40 ms / chunk</span><br><span id="chunkLabel"></span></span>
+    </div>
+    <div class="check">
+      <input id="emitDoc" type="checkbox">
+      <label for="emitDoc" style="margin:0">also fold a Document</label>
+    </div>
+    <button id="run">Stream it</button>
+  </div>
+
+  <div class="panel">
+    <label for="layout">Layout <span id="layoutKind" class="hint"></span></label>
+    <textarea id="layout" spellcheck="false"></textarea>
+  </div>
+
+  <div class="panel">
+    <div class="track">
+      <div class="fill" id="fill"></div>
+      <div class="mark" id="mark" title="first row"></div>
+      <div class="track-label"><span id="fedLabel">idle</span><span id="sizeLabel"></span></div>
+    </div>
+    <p class="verdict idle" id="verdict">Pick a file and press stream.</p>
+  </div>
+
+  <div class="panel stats">
+    <div class="stat"><b id="sRows">0</b><span>rows</span></div>
+    <div class="stat"><b id="sBytes">0</b><span>bytes decoded</span></div>
+    <div class="stat"><b id="sMs">0</b><span>ms to first row</span></div>
+    <div class="stat"><b id="sEnc">&ndash;</b><span>encoding</span></div>
+    <div class="stat"><b id="sLen">&ndash;</b><span>record bytes</span></div>
+  </div>
+
+  <div class="panel" id="layoutPanel" hidden>
+    <div class="layout" id="layoutOut"></div>
+  </div>
+
+  <div class="tables" id="tables"></div>
+
+  <div class="panel">
+    <div class="log" id="log"></div>
+  </div>
+</main>
+
+<footer>
+  The throttle delays the <em>upload</em> only, to make streaming visible on a
+  file that would otherwise finish inside one animation frame. The decoder
+  never waits for anything but bytes. Try
+  <code>statement.ebc</code> to see two record schemas routed by a one-byte
+  type prefix into two tables, and <code>sales-week.ebc</code> to see a COBOL
+  <code>OCCURS 7</code> arrive as seven packed-decimal columns. Fixtures are
+  real cp037 bytes; regenerate them with
+  <code>demos/sample-data/generate.py</code>.
+</footer>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+
+// The BFF injects this meta tag when it serves the page under a path prefix
+// (UI_BASE). Empty when the bridge runs at the root, so calls below are
+// unprefixed and nothing changes.
+const BASE = document.querySelector('meta[name="ui-base"]')?.content ?? "";
+
+/// Keep the DOM bounded. A real extract is gigabytes; the browser is not the
+/// thing this demo is trying to stress. Rows past the cap are counted in the
+/// stats but never touch the DOM.
+const MAX_ROWS_PER_TABLE = 500;
+
+let sizeBytes = 0;
+let samples = [];
+
+const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+const clip = (s, n = 90) => (s.length > n ? s.slice(0, n) + "…" : s);
+const num = (n) => n.toLocaleString("en-US");
+const kb = (n) =>
+  n < 1024 ? `${n} B`
+  : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KiB`
+  : `${(n / 1024 / 1024).toFixed(1)} MiB`;
+
+async function loadInfo() {
+  try {
+    const info = await (await fetch(`${BASE}/api/info`)).json();
+    $("encoding").innerHTML = (info.encodings ?? [])
+      .map((e) => `<option${e === info.defaultEncoding ? " selected" : ""}>${esc(e)}</option>`)
+      .join("");
+    if (info.ui?.title) document.title = `grpc-ebcdic: ${info.ui.title}`;
+  } catch {
+    $("encoding").innerHTML = `<option>cp037</option>`;
+  }
+}
+
+async function loadSamples() {
+  const { files } = await (await fetch(`${BASE}/api/samples`)).json();
+  samples = files;
+  $("sample").innerHTML = files
+    .map((f) => `<option value="${esc(f.name)}">${esc(f.name)} (${kb(f.size)})</option>`)
+    .join("");
+  await loadCompanion();
+}
+
+// A fixture's companion layout (copybook or Docling JSON) is loaded into the
+// editor, where it stays editable: the demo sends whatever is in the box.
+async function loadCompanion() {
+  const file = samples.find((f) => f.name === $("sample").value);
+  if (!file?.layout) {
+    $("layoutKind").textContent = "";
+    return;
+  }
+  const stem = file.name.slice(0, -".ebc".length);
+  const suffix = file.layout === "copybook" ? ".cpy" : ".layout.json";
+  const dir = file.name.includes("/") ? file.name.slice(0, file.name.lastIndexOf("/") + 1) : "";
+  const text = await (await fetch(`${BASE}/api/samples/${dir}${stem}${suffix}`)).text();
+  $("layout").value = text;
+  $("layoutKind").textContent = file.layout === "copybook"
+    ? "(COBOL copybook, compiled server-side)"
+    : "(Docling EbcdicLayout JSON)";
+}
+
+// A locally picked file wins over the dropdown, so changing the dropdown
+// clears the picker and the two cannot disagree silently.
+$("sample").addEventListener("change", () => { $("pick").value = ""; loadCompanion(); });
+$("delay").addEventListener("input", (e) => {
+  $("delayLabel").textContent = `${e.target.value} ms / chunk`;
+});
+
+/** Log one line to the run log. */
+function logLine(html) {
+  const div = document.createElement("div");
+  div.innerHTML = html;
+  $("log").append(div);
+}
+
+// ---------------------------------------------------------------------------
+// Tables, one per record schema
+// ---------------------------------------------------------------------------
+
+const tables = new Map(); // schema name -> {tbody, kept, fields}
+
+/** Build one table per schema from the layout_info event. */
+function buildTables(layoutInfo) {
+  $("tables").innerHTML = "";
+  tables.clear();
+  for (const schema of layoutInfo.records ?? []) {
+    const fields = (schema.fields ?? []).filter((f) => f.type !== "FIELD_TYPE_SKIP");
+    const wrap = document.createElement("div");
+    wrap.className = "panel table-wrap";
+    wrap.innerHTML =
+      `<div class="table-title">${esc(schema.name)} `
+      + `<span class="meta">${schema.recordLength} bytes/record`
+      + (schema.selector ? `, selector ${esc(JSON.stringify(schema.selector))}` : "")
+      + `</span></div>`
+      + `<table><thead><tr><th class="n">#</th>`
+      + fields.map((f) => `<th${numeric(f) ? ' class="n"' : ""}>${esc(f.name)}</th>`).join("")
+      + `</tr></thead><tbody></tbody></table>`;
+    $("tables").append(wrap);
+    tables.set(schema.name, { tbody: wrap.querySelector("tbody"), kept: 0, fields });
+  }
+
+  $("layoutPanel").hidden = false;
+  $("layoutOut").textContent = (layoutInfo.records ?? []).map((schema) =>
+    (schema.fields ?? []).map((f) =>
+      `${f.name.padEnd(20)} offset=${String(f.offset).padStart(4)} size=${String(f.size).padStart(3)} `
+      + `${f.type.replace("FIELD_TYPE_", "")}${f.scale ? ` scale=${f.scale}` : ""}`
+      + (f.picture ? `  ${f.picture}` : "")).join("\n")
+  ).join("\n\n");
+}
+
+const numeric = (f) =>
+  f.type === "FIELD_TYPE_INTEGER" || f.type === "FIELD_TYPE_UNSIGNED_INTEGER"
+  || f.type === "FIELD_TYPE_PACKED_DECIMAL" || f.type === "FIELD_TYPE_ZONED_DECIMAL";
+
+/** Append one decoded row to its schema's table. */
+function addRow(row) {
+  const table = tables.get(row.recordType) ?? [...tables.values()][0];
+  if (!table) return;
+  const byName = new Map((row.cells ?? []).map((c) => [c.name, cellText(c)]));
+  const tr = document.createElement("tr");
+  tr.className = "new";
+  tr.innerHTML = `<td class="idx n">${num(row.recordIndex)}</td>`
+    + table.fields.map((f) => {
+      const value = byName.get(f.name) ?? "";
+      const cls = numeric(f) ? "n" : "";
+      const neg = String(value).startsWith("-") ? " neg" : "";
+      return `<td class="${cls}${neg}">${esc(value)}</td>`;
+    }).join("");
+  table.tbody.append(tr);
+  table.kept++;
+  if (table.kept > MAX_ROWS_PER_TABLE) table.tbody.firstElementChild.remove();
+  tr.scrollIntoView({ block: "nearest" });
+}
+
+/** The one textual rendering of a cell: text, decimal text, or integer. */
+function cellText(cell) {
+  if (cell.text !== undefined && cell.text !== "") return cell.text;
+  if (cell.decimal) return cell.decimal.text;
+  if (cell.integer !== undefined) return cell.integer;
+  return cell.text ?? "";
+}
+
+// ---------------------------------------------------------------------------
+// The run
+// ---------------------------------------------------------------------------
+
+async function run() {
+  const button = $("run");
+  button.disabled = true;
+  $("tables").innerHTML = "";
+  $("log").innerHTML = "";
+  $("layoutPanel").hidden = true;
+  tables.clear();
+  $("mark").style.display = "none";
+  $("fill").style.width = "0";
+  $("verdict").className = "verdict idle";
+  $("verdict").textContent = "streaming…";
+  for (const id of ["sRows", "sBytes", "sMs"]) $(id).textContent = "0";
+  $("sEnc").textContent = "–";
+  $("sLen").textContent = "–";
+
+  try {
+    await stream();
+  } catch (err) {
+    logLine(`<span class="err">page error</span> ${esc(String(err))}`);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function stream() {
+  const picked = $("pick").files[0];
+  const body = picked
+    ? await picked.arrayBuffer()
+    : await (await fetch(`${BASE}/api/samples/${$("sample").value}`)).arrayBuffer();
+  sizeBytes = body.byteLength;
+  $("sizeLabel").textContent = kb(sizeBytes);
+
+  // The layout box holds either COBOL source or Docling JSON; JSON starts
+  // with a brace, a copybook never does.
+  const layoutText = $("layout").value;
+  const spec = layoutText.trimStart().startsWith("{")
+    ? { layoutJson: JSON.parse(layoutText) }
+    : { copybook: layoutText };
+
+  const params = new URLSearchParams();
+  params.set("encoding", $("encoding").value);
+  params.set("delayMs", $("delay").value);
+  if ($("emitDoc").checked) params.set("emitDocument", "1");
+
+  // Aim for roughly 40 upload steps whatever the file size, so a 300 byte
+  // fixture and a 50 MiB extract both show the same thing. Chunk size changes
+  // nothing about the rows, only how finely you get to watch them arrive.
+  const chunkBytes = Math.min(1 << 20, Math.max(16, Math.ceil(sizeBytes / 40)));
+  params.set("chunkBytes", chunkBytes);
+  $("chunkLabel").textContent = `${kb(chunkBytes)} chunks`;
+
+  // The layout is user-edited text; it rides base64url in a header rather
+  // than the URL. TextEncoder + btoa, chunked so neither blows up on Unicode.
+  const specBytes = new TextEncoder().encode(JSON.stringify(spec));
+  let bin = "";
+  for (let i = 0; i < specBytes.length; i += 0x8000) {
+    bin += String.fromCharCode(...specBytes.subarray(i, i + 0x8000));
+  }
+  const layoutHeader = btoa(bin).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+
+  const started = performance.now();
+  let rows = 0, fed = 0, firstRowAt = null;
+
+  const res = await fetch(`${BASE}/api/parse?${params}`, {
+    method: "POST",
+    headers: { "x-ebcdic-layout": layoutHeader },
+    body,
+  });
+  if (!res.ok) {
+    const problem = await res.json();
+    logLine(`<span class="err">${esc(problem.error)}</span>`);
+    $("verdict").textContent = "The bridge refused the request.";
+    return;
+  }
+
+  // SSE over a POST response, so it is parsed by hand: EventSource only does
+  // GET, and the whole point is that the upload and the row stream are one
+  // request.
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let at = 0;
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let split;
+    while ((split = buffer.indexOf("\n\n", at)) !== -1) {
+      const raw = buffer.slice(at, split);
+      at = split + 2;
+
+      const nl = raw.indexOf("\n");
+      if (nl < 0 || !raw.startsWith("event: ")) continue;
+      const kind = raw.slice(7, nl);
+      const rest = raw.slice(nl + 1);
+      if (!rest.startsWith("data: ")) continue;
+      const data = JSON.parse(rest.slice(6));
+
+      if (kind === "fed") {
+        fed = data.bytes;
+        $("fill").style.width = `${(fed / sizeBytes) * 100}%`;
+        $("fedLabel").textContent = `${kb(fed)} fed to the decoder`;
+        continue;
+      }
+      if (kind === "done") continue;
+
+      if (kind === "layoutInfo") {
+        $("sEnc").textContent = data.encoding;
+        const single = (data.records ?? []).length === 1 ? data.records[0] : null;
+        if (single) $("sLen").textContent = `${single.recordLength + (data.prefixSize ?? 0)}`;
+        buildTables(data);
+        logLine(`<span class="k">layout</span> ${esc(data.encoding)}, `
+          + `${(data.records ?? []).length} schema(s)`
+          + (data.description ? `, ${esc(data.description)}` : ""));
+        continue;
+      }
+      if (kind === "record") {
+        rows++;
+        $("sRows").textContent = num(rows);
+        $("sBytes").textContent = num(data.byteOffset ?? 0);
+        if (firstRowAt === null) firstRowAt = markFirstRow(fed, started);
+        addRow(data);
+        continue;
+      }
+      if (kind === "document") {
+        const bytesKb = kb(JSON.stringify(data).length);
+        logLine(`<span class="k">document</span> folded Document received (${bytesKb} as JSON)`);
+        continue;
+      }
+      if (kind === "status") {
+        finishStatus(data);
+        continue;
+      }
+      if (kind === "grpc-error") {
+        logLine(`<span class="err">rpc failed</span> ${esc(data.message)}`);
+        $("verdict").className = "verdict idle";
+        $("verdict").textContent = "The server failed the stream; see the log.";
+        continue;
+      }
+      // An arm this page has no name for; the contract says ignore it.
+    }
+
+    if (at > 0) {
+      buffer = buffer.slice(at);
+      at = 0;
+    }
+  }
+
+  if (firstRowAt === null && !$("verdict").textContent.includes("failed")) {
+    $("verdict").className = "verdict idle";
+    $("verdict").textContent = "No rows. The layout matched nothing; check the log.";
+  }
+}
+
+/** Place the marker and say how far in the first row landed. */
+function markFirstRow(fed, started) {
+  const pct = (fed / sizeBytes) * 100;
+  $("mark").style.left = `${pct}%`;
+  $("mark").style.display = "block";
+  $("sMs").textContent = Math.round(performance.now() - started);
+  $("verdict").className = "verdict";
+  $("verdict").innerHTML = `First row after <strong>${kb(fed)} of ${kb(sizeBytes)}</strong>`
+    + ` (${pct.toFixed(0)}% uploaded). The rest of the file had not been sent yet.`;
+  return fed;
+}
+
+/** Render the trailer: counts, per-schema totals, and any warnings. */
+function finishStatus(status) {
+  $("sBytes").textContent = num(status.bytesConsumed ?? 0);
+  const perSchema = Object.entries(status.rowsPerRecordType ?? {})
+    .map(([name, n]) => `${name}:${n}`).join(", ");
+  logLine(`<span class="ok">status</span> ${num(status.recordsKept)} rows, `
+    + `${num(status.bytesConsumed)} of ${num(status.bytesReceived)} bytes walked`
+    + (status.trailingBytes ? `, ${status.trailingBytes} trailing` : "")
+    + (status.truncated ? ", truncated" : "")
+    + (perSchema ? ` <span class="k">[${esc(perSchema)}]</span>` : ""));
+  for (const w of status.warnings ?? []) {
+    logLine(`<span class="err">${esc(w.code.replace("WARNING_CODE_", ""))}</span> `
+      + `${esc(w.message)} <span class="k">at byte ${num(w.byteOffset)}</span>`);
+  }
+}
+
+$("run").addEventListener("click", run);
+await loadInfo();
+await loadSamples();
+</script>
+</body>
+</html>

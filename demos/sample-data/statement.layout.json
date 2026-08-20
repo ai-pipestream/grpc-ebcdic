@@ -1,0 +1,59 @@
+{
+  "description": "Bank statement: one account header, then its transaction lines.",
+  "record_type_field": {
+    "name": "REC-TYPE",
+    "size": 1,
+    "type": "string"
+  },
+  "records": [
+    {
+      "name": "ACCOUNT-HEADER",
+      "selector": "H",
+      "fields": [
+        {
+          "name": "ACCOUNT-NO",
+          "size": 10,
+          "type": "string"
+        },
+        {
+          "name": "ACCOUNT-NAME",
+          "size": 24,
+          "type": "string"
+        },
+        {
+          "name": "OPENING-BALANCE",
+          "size": 6,
+          "type": "packed_decimal",
+          "scale": 2
+        }
+      ]
+    },
+    {
+      "name": "TRANSACTION",
+      "selector": "D",
+      "fields": [
+        {
+          "name": "POST-DATE",
+          "size": 10,
+          "type": "string"
+        },
+        {
+          "name": "MEMO",
+          "size": 20,
+          "type": "string"
+        },
+        {
+          "name": "AMOUNT",
+          "size": 6,
+          "type": "packed_decimal",
+          "scale": 2
+        },
+        {
+          "name": "SEQ",
+          "size": 2,
+          "type": "integer"
+        }
+      ]
+    }
+  ]
+}

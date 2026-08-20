@@ -46,6 +46,26 @@ grpcurl -plaintext localhost:50063 grpc.health.v1.Health/Check
 
 ---
 
+## Web demo
+
+A dependency-light Node bridge and live viewer, in
+[`demos/node-client`](demos/node-client):
+
+```bash
+cd demos/node-client
+npm install
+npm start   # http://127.0.0.1:8089
+```
+
+The browser POSTs an `.ebc` file and reads decoded rows off the same response
+as Server-Sent Events, one table per record schema, while the upload bar is
+still filling. Fixtures with companion layouts (copybook or Docling JSON) live
+in [`demos/sample-data`](demos/sample-data). The viewer honours `EBCDIC_ADDR`,
+`PORT`, and `UI_BASE` (serve under a path prefix, e.g. `/ui/ebcdic` behind the
+demo shell). See its README for details.
+
+---
+
 ## Wire API
 
 `ai.pipestream.ebcdic.v1.EbcdicParseService`, defined in
