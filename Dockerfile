@@ -14,7 +14,7 @@
 #   docker build -t grpc-ebcdic .
 #   docker run --rm --read-only --cap-drop=ALL -p 50051:50051 grpc-ebcdic
 
-FROM rust:1.97-slim-trixie AS build
+FROM rust:1.98-slim-trixie AS build
 
 # protoc is the only build dependency beyond the Rust toolchain: build.rs
 # drives tonic-prost-build, which shells out to it.
