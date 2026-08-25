@@ -1252,3 +1252,236 @@ async fn a_folded_document_carries_the_layout_facts_and_the_row_count() {
         parsed.status.warnings
     );
 }
+
+/// Fold two customer records through a real server, document and all.
+async fn folded_customers() -> Parsed {
+    let client = start_server().await;
+    let options = pb::ParseOptions {
+        emit_document: true,
+        ..customer_options()
+    };
+    let mut data = customer(1, "ACME SUPPLY", -123_456_789, 42);
+    data.extend(customer(2, "BETA WORKS", 0, 7));
+    parse(&client, options, &data).await.unwrap()
+}
+
+/// The table data of a folded document's only table.
+fn only_table(document: &docpb::Document) -> &docpb::TableData {
+    document.tables[0]
+        .data
+        .as_ref()
+        .expect("the table has data")
+}
+
+#[tokio::test]
+async fn a_folded_document_declares_the_columns_the_copybook_declared() {
+    let parsed = folded_customers().await;
+    let document = parsed.document.expect("emit_document was set");
+    let table_data = only_table(&document);
+
+    // The copybook, not the rendering: what each column is, where it sits in
+    // the record, how it was declared, and what it is called in full.
+    assert_eq!(
+        table_data
+            .columns
+            .iter()
+            .map(|column| (
+                column.name.as_str(),
+                column.declared_type.as_deref(),
+                column.picture.as_deref(),
+                column.byte_offset,
+                column.byte_size,
+                column.level,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "CUSTOMER-RECORD.CUST-ID",
+                Some("zoned_decimal"),
+                Some("9(6)"),
+                Some(0),
+                Some(6),
+                Some(5)
+            ),
+            (
+                "CUSTOMER-RECORD.CUST-NAME",
+                Some("string"),
+                Some("X(20)"),
+                Some(6),
+                Some(20),
+                Some(5)
+            ),
+            (
+                "CUSTOMER-RECORD.CUST-BALANCE",
+                Some("packed_decimal"),
+                Some("S9(7)V99"),
+                Some(26),
+                Some(5),
+                Some(5)
+            ),
+            (
+                "CUSTOMER-RECORD.CUST-ORDER-COUNT",
+                Some("integer"),
+                Some("S9(4)"),
+                Some(31),
+                Some(2),
+                Some(5)
+            ),
+        ]
+    );
+    assert_eq!(
+        table_data.columns.len(),
+        usize::try_from(table_data.num_cols).unwrap(),
+        "one declaration per column"
+    );
+    // The trailing FILLER is not a column, and the offsets say so: the last
+    // column ends four bytes short of the record.
+    let last = table_data.columns.last().unwrap();
+    assert_eq!(
+        last.byte_offset.unwrap() + last.byte_size.unwrap() + 4,
+        u64::from(CUSTOMER_RECORD_BYTES)
+    );
+
+    // The layout event carries the same declarations the columns were built
+    // from.
+    let schema = &parsed.layout.records[0];
+    assert_eq!(
+        schema
+            .fields
+            .iter()
+            .map(|field| field.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "CUSTOMER-RECORD.CUST-ID",
+            "CUSTOMER-RECORD.CUST-NAME",
+            "CUSTOMER-RECORD.CUST-BALANCE",
+            "CUSTOMER-RECORD.CUST-ORDER-COUNT",
+            "",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_folded_document_carries_typed_values_and_record_byte_extents() {
+    let parsed = folded_customers().await;
+    let document = parsed.document.clone().expect("emit_document was set");
+    let table_data = only_table(&document);
+
+    // The balance is a number a consumer can add up, with the exact rendering
+    // still beside it.
+    let balance = &table_data.grid[1].cells[2];
+    assert_eq!(balance.text, "-1234567.89");
+    let Some(docpb::cell_value::Kind::Number(number)) =
+        balance.value.as_ref().and_then(|value| value.kind.as_ref())
+    else {
+        panic!("a packed decimal is a number, not {:?}", balance.value);
+    };
+    assert!((number - -1_234_567.89).abs() < 1e-6, "{number}");
+    // A character field is its text and nothing more.
+    assert!(table_data.grid[1].cells[1].value.is_none());
+
+    // Every row says which bytes of the input it came from, and the record
+    // events say the same thing, which is the point of folding rather than
+    // reparsing.
+    let spans: Vec<_> = table_data
+        .row_prov
+        .iter()
+        .map(|prov| prov.byte_range.as_ref().map(|span| (span.start, span.end)))
+        .collect();
+    assert_eq!(
+        spans,
+        vec![
+            None,
+            Some((0, u64::from(CUSTOMER_RECORD_BYTES))),
+            Some((
+                u64::from(CUSTOMER_RECORD_BYTES),
+                u64::from(CUSTOMER_RECORD_BYTES) * 2
+            )),
+        ]
+    );
+    assert_eq!(
+        parsed
+            .rows
+            .iter()
+            .map(|row| (row.byte_offset, row.byte_length))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, u64::from(CUSTOMER_RECORD_BYTES)),
+            (
+                u64::from(CUSTOMER_RECORD_BYTES),
+                u64::from(CUSTOMER_RECORD_BYTES)
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_layout_event_carries_condition_names_and_occurrences() {
+    let client = start_server().await;
+    let copybook = "01 REC.\n\
+                    05 STATUS-CODE PIC X.\n\
+                    88 STATUS-OPEN VALUE 'O'.\n\
+                    88 STATUS-SHUT VALUES ARE 'C' 'X'.\n\
+                    05 MONTH-TOTAL PIC 9(2) OCCURS 2.\n";
+    let options = pb::ParseOptions {
+        layout_source: Some(pb::parse_options::LayoutSource::Copybook(
+            copybook.to_string(),
+        )),
+        emit_document: true,
+        ..Default::default()
+    };
+    let data = Encoder::new("cp037")
+        .text("O", 1)
+        .zoned(1, 2)
+        .zoned(2, 2)
+        .build();
+
+    let parsed = parse(&client, options, &data).await.unwrap();
+    let fields = &parsed.layout.records[0].fields;
+    // The enumeration a copybook declares is the closest thing it has to a
+    // constraint, and it used to be parsed and thrown away.
+    assert_eq!(
+        fields[0]
+            .conditions
+            .iter()
+            .map(|condition| (condition.name.as_str(), condition.values.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("STATUS-OPEN", vec!["O".to_string()]),
+            ("STATUS-SHUT", vec!["C".to_string(), "X".to_string()]),
+        ]
+    );
+    // An occurrence knows which index it is and what it repeats, rather than
+    // leaving both inside a column name for a consumer to parse back out.
+    assert_eq!(
+        fields[1..]
+            .iter()
+            .map(|field| (
+                field.name.as_str(),
+                field.occurs_group.as_deref(),
+                field.occurs_index
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("MONTH-TOTAL(1)", Some("MONTH-TOTAL"), Some(1)),
+            ("MONTH-TOTAL(2)", Some("MONTH-TOTAL"), Some(2)),
+        ]
+    );
+    // The document names them the way the copybook does.
+    let table = &parsed.document.expect("emit_document was set").tables[0];
+    assert_eq!(
+        table
+            .data
+            .as_ref()
+            .unwrap()
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "REC.STATUS-CODE",
+            "REC.MONTH-TOTAL(1)",
+            "REC.MONTH-TOTAL(2)"
+        ]
+    );
+}

@@ -29,6 +29,28 @@
 //!   per [`RecordRow`](crate::proto::v1::RecordRow), cells in field order,
 //!   decimals carried across as their exact canonical text.
 //!
+//! What the flat shape cannot say, the extended schema now can, and the fold
+//! fills all three in:
+//!
+//! - `TableData.columns` is one
+//!   [`TableColumnSchema`](crate::proto::document::v1::TableColumnSchema) per
+//!   column in layout order, carrying the declared type, the picture clause,
+//!   the byte offset and width inside the record body, the COBOL level number,
+//!   and the qualification path. A grid of strings becomes a grid a consumer
+//!   can parse without guessing from the rendering.
+//! - `TableCell.value` is the cell's number when it has one, alongside the
+//!   rendering in `text` that every existing reader already reads.
+//! - `TableData.row_prov` is one
+//!   [`ProvenanceItem`](crate::proto::document::v1::ProvenanceItem) per grid
+//!   row carrying the record's byte extent, which is the only location a
+//!   record has.
+//!
+//! Two things the copybook declares still stop at this boundary, because the
+//! document schema has nowhere to put them: level-88 condition names and the
+//! `OCCURS` index as a number. Both are first-class on this collector's own
+//! contract, in `FieldSchema.conditions` and `FieldSchema.occurs_index`, and
+//! the column path carries the COBOL subscript that names the occurrence.
+//!
 //! One thing is deliberately kept past docling: every table carries its schema
 //! name in `meta.custom_fields["ebcdic.schema"]`. Upstream loses that name
 //! entirely in the single-schema case, where it emits no heading, and a table
@@ -87,9 +109,9 @@ const FURNITURE_REF: &str = "#/furniture";
 struct TableState {
     /// Schema name, as it appears on every row and in the warning message.
     name: String,
-    /// Non-filler field names in field order: the header row, and the column
-    /// order every data row is aligned to.
-    columns: Vec<String>,
+    /// Non-filler columns in field order: the header row, the column order
+    /// every data row is aligned to, and the declarations behind both.
+    columns: Vec<Column>,
     /// Column position by field name, so a row's named cells can be placed
     /// without trusting their order.
     column_index: BTreeMap<String, usize>,
@@ -106,6 +128,18 @@ struct TableState {
     first_dropped_offset: u64,
     /// The folded data rows, in arrival order, header row excluded.
     grid: Vec<doc::TableRow>,
+    /// Where each folded row sat in the input, index-aligned with `grid`.
+    row_prov: Vec<doc::ProvenanceItem>,
+}
+
+/// One column of a folded table: what its header cell says, and what the
+/// layout declared about the bytes behind it.
+struct Column {
+    /// Field name as the layout declared it, which is the header cell's text
+    /// and the name a row's cells are placed by.
+    name: String,
+    /// The declaration that lands in `TableData.columns`.
+    schema: doc::TableColumnSchema,
 }
 
 /// A single-pass fold from parse events to one Document.
@@ -274,6 +308,11 @@ impl DocumentFold {
             info.description.clone()
         };
 
+        // The body's five keys all still describe the parse rather than any one
+        // item, and the extended schema has grown no home for a source code
+        // page, a boundary width or a record prefix, so all five stay where
+        // they are. `ebcdic.layout_source` remains the duplicate it always was
+        // of `CollectorSource.model`.
         let mut custom_fields = HashMap::new();
         custom_fields.insert("ebcdic.encoding".to_string(), string_value(&info.encoding));
         if let Some(source) = self.model.clone() {
@@ -299,16 +338,21 @@ impl DocumentFold {
         }
 
         for schema in &info.records {
-            let columns: Vec<String> = schema
+            // Fillers are not columns: they name nothing and decode to
+            // nothing. They are not lost either, because every column declares
+            // its byte offset and width, so a filler is the gap between two
+            // neighbours and the last column's end is short of
+            // `ebcdic.record_length` by exactly a trailing filler's width.
+            let columns: Vec<Column> = schema
                 .fields
                 .iter()
                 .filter(|field| field.r#type != pb::FieldType::Skip as i32)
-                .map(|field| field.name.clone())
+                .map(column)
                 .collect();
             let column_index = columns
                 .iter()
                 .enumerate()
-                .map(|(index, name)| (name.clone(), index))
+                .map(|(index, column)| (column.name.clone(), index))
                 .collect();
             self.index_by_schema
                 .insert(schema.name.clone(), self.tables.len());
@@ -322,6 +366,7 @@ impl DocumentFold {
                 dropped: 0,
                 first_dropped_offset: 0,
                 grid: Vec::new(),
+                row_prov: Vec::new(),
             });
         }
     }
@@ -346,19 +391,30 @@ impl DocumentFold {
         // Cells arrive named, so they are placed by name rather than by
         // position: a short row leaves its columns empty instead of shifting
         // every later value one column to the left.
-        let mut texts = vec![String::new(); state.columns.len()];
+        let mut values: Vec<(String, Option<doc::CellValue>)> =
+            vec![(String::new(), None); state.columns.len()];
         for cell in &row.cells {
             if let Some(&column) = state.column_index.get(&cell.name) {
-                texts[column] = cell_text(cell);
+                values[column] = (cell_text(cell), cell_value(cell));
             }
         }
 
-        let cells: Vec<doc::TableCell> = texts
+        let cells: Vec<doc::TableCell> = values
             .into_iter()
             .enumerate()
-            .map(|(column, text)| table_cell(text, grid_row, column, false))
+            .map(|(column, (text, value))| table_cell(text, value, grid_row, column, false))
             .collect();
         state.grid.push(doc::TableRow { cells });
+        // The record's own extent in the input. A row of a mainframe extract
+        // has no page and no box, and this is the location an auditor of one
+        // actually asks for.
+        state.row_prov.push(doc::ProvenanceItem {
+            byte_range: Some(doc::ByteSpan {
+                start: row.byte_offset,
+                end: row.byte_offset.saturating_add(row.byte_length),
+            }),
+            ..Default::default()
+        });
     }
 
     /// Append the layout description as the document's opening text item.
@@ -421,7 +477,7 @@ impl DocumentFold {
             .columns
             .iter()
             .enumerate()
-            .map(|(column, name)| table_cell(name.clone(), 0, column, true))
+            .map(|(column, declared)| table_cell(declared.name.clone(), None, 0, column, true))
             .collect();
         // Both arenas, always: a consumer may read the flat cells or walk the
         // grid, and a document where those two disagree is worse than one that
@@ -432,6 +488,18 @@ impl DocumentFold {
         }
         let mut grid = vec![doc::TableRow { cells: header }];
         grid.append(&mut state.grid);
+        // Row provenance is index-aligned with the grid, and the grid's first
+        // row is the header. The header was assembled from the copybook rather
+        // than read from the input, so its entry names no location at all: an
+        // empty entry is the only honest one, and dropping it would put every
+        // later row one place out.
+        let mut row_prov = vec![doc::ProvenanceItem::default()];
+        row_prov.append(&mut state.row_prov);
+        let columns: Vec<doc::TableColumnSchema> = std::mem::take(&mut state.columns)
+            .into_iter()
+            .map(|column| column.schema)
+            .collect();
+        let num_cols = clamp(columns.len() as u64);
 
         let source = self.collector_source();
         self.link_body_child(&self_ref);
@@ -440,9 +508,10 @@ impl DocumentFold {
             parent: Some(ref_item(BODY_REF)),
             content_layer: doc::ContentLayer::Body as i32,
             label: doc::DocItemLabel::Table as i32,
-            // No prov: an EBCDIC record has a byte offset, not a page and not
-            // a box. The offsets live in the typed `record` events, which is
-            // where a caller that needs them should be looking.
+            // No prov on the table itself: the records of one schema are
+            // interleaved with every other schema's in the input, so a table
+            // spans no single range of bytes. Its rows do, and each one says
+            // so in `data.row_prov`.
             meta: Some(doc::FloatingMeta {
                 custom_fields,
                 ..Default::default()
@@ -450,9 +519,11 @@ impl DocumentFold {
             data: Some(doc::TableData {
                 // The header row is a row of the grid, so the count includes it.
                 num_rows: clamp(state.rows.saturating_add(1)),
-                num_cols: clamp(state.columns.len() as u64),
+                num_cols,
                 table_cells,
                 grid,
+                columns,
+                row_prov,
                 ..Default::default()
             }),
             source: vec![source],
@@ -488,10 +559,24 @@ impl DocumentFold {
 
 /// The custom fields of one schema's table.
 ///
-/// `ebcdic.schema` is the one field upstream has no equivalent of: docling
-/// names a schema only through the heading it emits when there is more than
-/// one, so a single-schema document loses the name altogether. Naming it here
-/// costs nothing and keeps every table self-describing.
+/// `ebcdic.schema` is the one field upstream has no equivalent of: a schema is
+/// named only through the heading emitted when there is more than one, so a
+/// single-schema document loses the name altogether. Naming it here costs
+/// nothing and keeps every table self-describing.
+///
+/// Where the extended schema has grown a home, that home is now the truth and
+/// the key is a duplicate kept for one release so that no reader breaks on the
+/// same day the fold starts filling it in:
+///
+/// - `ebcdic.rows` duplicates `TableData.num_rows` less the header row.
+/// - the per-column facts these keys used to stand in for - the field type,
+///   the picture, the byte offset and width, the level, the path - are now
+///   `TableData.columns`, and the per-row byte offsets are
+///   `TableData.row_prov`.
+///
+/// `ebcdic.selector`, `ebcdic.record_length` and `ebcdic.rows_truncated` have
+/// no first-class home in the extended schema, so they stay custom fields
+/// rather than being dropped.
 fn table_custom_fields(state: &TableState) -> HashMap<String, Value> {
     let mut custom_fields = HashMap::new();
     custom_fields.insert("ebcdic.schema".to_string(), string_value(&state.name));
@@ -512,6 +597,85 @@ fn table_custom_fields(state: &TableState) -> HashMap<String, Value> {
     custom_fields
 }
 
+/// One column of a folded table, from the field schema behind it.
+///
+/// The header cell keeps the flat field name, which is what a reader sees and
+/// what a row's cells are placed by. The column declaration carries the name
+/// the copybook actually gives the field: the dotted qualification path with
+/// its subscript, `CUSTOMER-RECORD.TOTALS.MONTH(2)` rather than `MONTH(2)`.
+/// The flat layout forms have no groups, so for them the two are the same
+/// string.
+///
+/// `byte_offset` is measured from the start of the record body, as
+/// `FieldSchema.offset` is, so the two never disagree. The body starts
+/// `ebcdic.prefix_size` bytes into the record extent that `row_prov` reports.
+fn column(field: &pb::FieldSchema) -> Column {
+    let path = if field.path.is_empty() {
+        field.name.clone()
+    } else {
+        field.path.clone()
+    };
+    Column {
+        name: field.name.clone(),
+        schema: doc::TableColumnSchema {
+            name: path,
+            declared_type: field_type_name(field.r#type).map(str::to_string),
+            picture: if field.picture.is_empty() {
+                None
+            } else {
+                Some(field.picture.clone())
+            },
+            byte_offset: Some(u64::from(field.offset)),
+            byte_size: Some(u64::from(field.size)),
+            // Only a copybook has levels; the flat forms leave this unset
+            // rather than claim an 01.
+            level: field.level.and_then(|level| i32::try_from(level).ok()),
+        },
+    }
+}
+
+/// The name of a field type, in the vocabulary the layout forms use.
+///
+/// The same spelling the JSON layout form accepts, so a consumer reading
+/// `declared_type` off a column can write the layout that produced it. `None`
+/// for a type this build has no name for, which the server never emits.
+fn field_type_name(field_type: i32) -> Option<&'static str> {
+    match pb::FieldType::try_from(field_type) {
+        Ok(pb::FieldType::String) => Some("string"),
+        Ok(pb::FieldType::Integer) => Some("integer"),
+        Ok(pb::FieldType::UnsignedInteger) => Some("unsigned_integer"),
+        Ok(pb::FieldType::PackedDecimal) => Some("packed_decimal"),
+        Ok(pb::FieldType::ZonedDecimal) => Some("zoned_decimal"),
+        Ok(pb::FieldType::Skip) => Some("skip"),
+        Ok(pb::FieldType::Unspecified) | Err(_) => None,
+    }
+}
+
+/// The typed value of one decoded cell, when it has one a `CellValue` can
+/// hold.
+///
+/// Text cells get none: `CellValue` has no text arm, and `TableCell.text` is
+/// already the whole of a character field. A numeric cell gets the nearest
+/// double, which is what the schema's `number` arm is; the exact value stays
+/// in `text`, because a scaled decimal is not generally representable in
+/// binary and a `PIC S9(18)V99 COMP-3` has more digits than a double has.
+/// The scale and the picture are not repeated on every cell: they belong to
+/// the column and are declared once, in `TableData.columns`.
+#[allow(clippy::cast_precision_loss)]
+fn cell_value(cell: &pb::Cell) -> Option<doc::CellValue> {
+    let number = match cell.value.as_ref()? {
+        pb::cell::Value::Text(_) => return None,
+        // Parsed from the canonical text rather than rebuilt from `unscaled`,
+        // so the rounding happens once and against the value the reader sees.
+        pb::cell::Value::Decimal(decimal) => decimal.text.parse::<f64>().ok()?,
+        pb::cell::Value::Integer(integer) => *integer as f64,
+    };
+    Some(doc::CellValue {
+        kind: Some(doc::cell_value::Kind::Number(number)),
+        number_format: None,
+    })
+}
+
 /// Render one decoded cell as table text.
 ///
 /// A `Decimal` is carried across as its own canonical rendering, character for
@@ -529,7 +693,13 @@ fn cell_text(cell: &pb::Cell) -> String {
 
 /// One table cell at `(row, column)`. Spans are always one: a record layout is
 /// a rectangle by construction.
-fn table_cell(text: String, row: u64, column: usize, column_header: bool) -> doc::TableCell {
+fn table_cell(
+    text: String,
+    value: Option<doc::CellValue>,
+    row: u64,
+    column: usize,
+    column_header: bool,
+) -> doc::TableCell {
     let row = clamp(row);
     let column = clamp(column as u64);
     doc::TableCell {
@@ -547,8 +717,11 @@ fn table_cell(text: String, row: u64, column: usize, column_header: bool) -> doc
         row_section: false,
         fillable: false,
         r#ref: None,
-        // Filled in by the typed-cell wiring; a header cell never has either.
-        value: None,
+        // The typed value alongside the rendering, for the consumer that has
+        // to compute rather than display.
+        value,
+        // No spans: a decoded field is one run of plain text, with no
+        // emphasis and no links to mark up.
         spans: Vec::new(),
     }
 }
@@ -890,6 +1063,31 @@ mod tests {
             .collect()
     }
 
+    /// The column declarations of a table.
+    fn columns(table: &doc::TableItem) -> &[doc::TableColumnSchema] {
+        &table.data.as_ref().unwrap().columns
+    }
+
+    /// The byte extent one grid row reports, or `None` when it reports none.
+    fn row_span(table: &doc::TableItem, row: usize) -> Option<(u64, u64)> {
+        table.data.as_ref().unwrap().row_prov[row]
+            .byte_range
+            .as_ref()
+            .map(|span| (span.start, span.end))
+    }
+
+    /// The typed value of one grid cell, which for this collector is a number
+    /// or nothing at all.
+    fn cell_number(table: &doc::TableItem, row: usize, column: usize) -> Option<f64> {
+        let value = table.data.as_ref().unwrap().grid[row].cells[column]
+            .value
+            .as_ref()?;
+        match value.kind.as_ref().expect("a value with no arm set") {
+            doc::cell_value::Kind::Number(number) => Some(*number),
+            other => panic!("an EBCDIC cell is a number or nothing, not {other:?}"),
+        }
+    }
+
     /// The base of a text item, whichever variant it is.
     fn text_base(item: &doc::BaseTextItem) -> &doc::TextItemBase {
         match item.item.as_ref().expect("the variant is set") {
@@ -1050,6 +1248,187 @@ mod tests {
                 .map(|row| row_text(table, row)[1].clone())
                 .collect::<Vec<_>>(),
             vec!["1.00", "-123.45", "0.00"]
+        );
+    }
+
+    #[test]
+    fn the_columns_declare_what_the_grid_only_renders() {
+        let document = fold(
+            &options(two_schema_layout()),
+            &customer("JANE", [0x12, 0x34, 0x5d]),
+            DocumentFold::new(VERSION),
+        );
+        let table = &document.tables[0];
+        let declared = columns(table);
+        assert_eq!(
+            declared.len(),
+            usize::try_from(table.data.as_ref().unwrap().num_cols).unwrap(),
+            "one declaration per grid column, or the alignment means nothing"
+        );
+        assert_eq!(
+            declared
+                .iter()
+                .map(|column| (
+                    column.name.as_str(),
+                    column.declared_type.as_deref(),
+                    column.byte_offset,
+                    column.byte_size,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("NAME", Some("string"), Some(0), Some(4)),
+                ("BALANCE", Some("packed_decimal"), Some(4), Some(3)),
+            ]
+        );
+        // A protobuf layout is flat and carries no picture clauses, and the
+        // fold declares neither rather than inventing them.
+        assert!(
+            declared
+                .iter()
+                .all(|column| column.level.is_none() && column.picture.is_none())
+        );
+        // The header row renders the same columns, in the same order.
+        assert_eq!(
+            declared
+                .iter()
+                .map(|column| column.name.clone())
+                .collect::<Vec<_>>(),
+            row_text(table, 0)
+        );
+    }
+
+    #[test]
+    fn a_filler_is_the_gap_the_column_offsets_leave() {
+        let options = pb::ParseOptions {
+            layout_source: Some(pb::parse_options::LayoutSource::Copybook(
+                "01 REC.\n05 A PIC X(2).\n05 FILLER PIC X(3).\n05 B PIC X(2).\n".into(),
+            )),
+            ..Default::default()
+        };
+        let document = fold(
+            &options,
+            &Codec::resolve("cp037").unwrap().encode("AAxxxBB").unwrap(),
+            DocumentFold::new(VERSION),
+        );
+        let table = &document.tables[0];
+        // The filler is not a column, and it did not have to be: the three
+        // bytes between the end of A and the start of B are the whole of it.
+        assert_eq!(
+            columns(table)
+                .iter()
+                .map(|column| (column.name.as_str(), column.byte_offset, column.byte_size))
+                .collect::<Vec<_>>(),
+            vec![("REC.A", Some(0), Some(2)), ("REC.B", Some(5), Some(2)),]
+        );
+        assert_eq!(row_text(table, 1), vec!["AA", "BB"]);
+    }
+
+    #[test]
+    fn a_copybook_column_carries_its_path_its_level_and_its_picture() {
+        let options = pb::ParseOptions {
+            layout_source: Some(pb::parse_options::LayoutSource::Copybook(
+                "01 REC.\n05 ADDRESS.\n10 STREET PIC X(4).\n05 MONTH PIC 9(2) OCCURS 2.\n".into(),
+            )),
+            ..Default::default()
+        };
+        let document = fold(
+            &options,
+            &Codec::resolve("cp037").unwrap().encode("MAIN0102").unwrap(),
+            DocumentFold::new(VERSION),
+        );
+        let table = &document.tables[0];
+        // The header keeps the flat name a reader sees; the declaration keeps
+        // the name the copybook gives the field, subscript and all, so an
+        // occurrence is no longer a sibling column with an index buried in a
+        // string.
+        assert_eq!(row_text(table, 0), vec!["STREET", "MONTH(1)", "MONTH(2)"]);
+        assert_eq!(
+            columns(table)
+                .iter()
+                .map(|column| (
+                    column.name.as_str(),
+                    column.level,
+                    column.picture.as_deref(),
+                    column.declared_type.as_deref(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("REC.ADDRESS.STREET", Some(10), Some("X(4)"), Some("string")),
+                ("REC.MONTH(1)", Some(5), Some("9(2)"), Some("zoned_decimal")),
+                ("REC.MONTH(2)", Some(5), Some("9(2)"), Some("zoned_decimal")),
+            ]
+        );
+        assert_eq!(row_text(table, 1), vec!["MAIN", "1", "2"]);
+    }
+
+    #[test]
+    fn a_numeric_cell_carries_a_number_and_a_text_cell_carries_none() {
+        let mut data = customer("JANE", [0x12, 0x34, 0x5d]);
+        data.extend(order("042"));
+        let document = fold(
+            &options(two_schema_layout()),
+            &data,
+            DocumentFold::new(VERSION),
+        );
+
+        let customers = &document.tables[0];
+        // `CellValue` has no text arm and needs none: a character field is
+        // already the whole of `TableCell.text`.
+        assert_eq!(cell_number(customers, 1, 0), None);
+        assert_eq!(row_text(customers, 1)[0], "JANE");
+        // The scaled packed decimal is a number a consumer can compute with,
+        // and the exact rendering is still there beside it.
+        let balance = cell_number(customers, 1, 1).expect("a packed decimal is a number");
+        assert!((balance - -123.45).abs() < 1e-9, "{balance}");
+        assert_eq!(row_text(customers, 1)[1], "-123.45");
+        // The scale lives on the column, once, rather than on every cell.
+        assert_eq!(
+            columns(customers)[1].declared_type.as_deref(),
+            Some("packed_decimal")
+        );
+
+        let orders = &document.tables[1];
+        let quantity = cell_number(orders, 1, 0).expect("a zoned integer is a number");
+        assert!((quantity - 42.0).abs() < f64::EPSILON, "{quantity}");
+        // A header cell is a label, not a value.
+        assert_eq!(cell_number(orders, 0, 0), None);
+    }
+
+    #[test]
+    fn every_row_says_where_its_record_was_and_the_header_says_nothing() {
+        // A customer is ten bytes on the wire (a one-byte selector prefix, a
+        // four-byte name, three packed bytes, two filler) and an order is four.
+        let mut data = customer("JANE", [0x12, 0x34, 0x5d]);
+        data.extend(order("042"));
+        data.extend(customer("BOB!", [0x00, 0x10, 0x0c]));
+        let document = fold(
+            &options(two_schema_layout()),
+            &data,
+            DocumentFold::new(VERSION),
+        );
+
+        for table in &document.tables {
+            let data = table.data.as_ref().unwrap();
+            assert_eq!(
+                data.row_prov.len(),
+                data.grid.len(),
+                "row provenance is index-aligned with the grid or it is useless"
+            );
+            assert_eq!(
+                row_span(table, 0),
+                None,
+                "the header row was assembled from the copybook, not read from the input"
+            );
+        }
+        let customers = &document.tables[0];
+        assert_eq!(row_span(customers, 1), Some((0, 10)));
+        assert_eq!(row_span(customers, 2), Some((14, 24)));
+        // The interleaved order record sits between the two customers, which
+        // is why a table spans no single range and its rows each carry one.
+        assert_eq!(row_span(&document.tables[1], 1), Some((10, 14)));
+        assert!(
+            document.tables.iter().all(|table| table.prov.is_empty()),
+            "a table of interleaved records has no one location"
         );
     }
 
@@ -1318,6 +1697,12 @@ mod tests {
         assert_eq!(table.data.as_ref().unwrap().num_rows, 3, "header plus two");
         assert_eq!(row_text(table, 1)[0], "AAAA");
         assert_eq!(row_text(table, 2)[0], "BBBB");
+        // A dropped row leaves no provenance behind either: what is in the
+        // grid and what claims a location are the same rows.
+        let data_ = table.data.as_ref().unwrap();
+        assert_eq!(data_.row_prov.len(), data_.grid.len());
+        assert_eq!(row_span(table, 1), Some((0, 10)));
+        assert_eq!(row_span(table, 2), Some((10, 20)));
         let fields = &table.meta.as_ref().unwrap().custom_fields;
         assert!((custom_number(fields, "ebcdic.rows") - 2.0).abs() < f64::EPSILON);
         assert!((custom_number(fields, "ebcdic.rows_truncated") - 2.0).abs() < f64::EPSILON);

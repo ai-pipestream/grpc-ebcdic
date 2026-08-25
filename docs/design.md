@@ -100,6 +100,9 @@ siblings of those headings rather than children. Everything hangs off
 | one `TableItem` per record schema | on `#/body`, the heading's sibling; grid row 0 is the field names with `column_header = true`, one non-`SKIP` field per column |
 | a schema that matched no record | nothing at all: no heading, no table |
 | one grid row per `RecordRow` | cells aligned by name against the schema's fields; `text` verbatim, `Decimal` as `Decimal.text` exactly, `integer` as its decimal string |
+| `TableCell.value` | the cell's number when the field is numeric, beside the rendering in `text`; a character field has none |
+| `TableData.columns` | one `TableColumnSchema` per column in layout order: declared type, picture clause, byte offset and width in the record body, COBOL level, and the dotted qualification path with its `OCCURS` subscript |
+| `TableData.row_prov` | one entry per grid row carrying the record's `ByteSpan` in the input; the header row's entry carries no location, because the header came from the copybook and not from the input |
 | `table.meta.custom_fields` | `ebcdic.schema`, `ebcdic.record_length`, `ebcdic.selector` (when the layout has one), `ebcdic.rows`, `ebcdic.rows_truncated` (only when rows were dropped) |
 | `CollectorSource` on every item | `collector = "ebcdic"`, `model` = the layout form (`proto` / `json` / `copybook`), `version` = the server's crate version |
 
@@ -111,16 +114,26 @@ self-describing without changing the item shape.
 
 ### Deliberately not mapped
 
-- `prov`, `bbox`, `pages`. An EBCDIC record has a byte offset, not a page and
-  not a rectangle. Inventing either would make a downstream viewer draw a box
-  over nothing. The offsets are in the `record` events, which is where a
-  caller that needs them should look.
+- `bbox`, `pages`, and item-level `prov`. An EBCDIC record has a byte offset,
+  not a page and not a rectangle. Inventing either would make a downstream
+  viewer draw a box over nothing. The byte offsets now reach the Document as
+  `TableData.row_prov`, one `ByteSpan` per row; a table carries no `prov` of
+  its own because the records of one schema are interleaved with every other
+  schema's and span no single range.
 - `confidence` on the source. A copybook is a declaration and the mapping is
   deterministic, so a confidence would be noise.
 - `field_regions` / `field_items`. The coordinator's additive merge does not
   renumber them and drops them silently.
 - Filler fields. `FIELD_TYPE_SKIP` produces no cell on the wire and no column
-  in the table; the bytes are consumed and that is all.
+  in the table; the bytes are consumed and that is all. Nothing is hidden by
+  it: a filler is the gap between the byte offsets of the columns on either
+  side of it, and a trailing one is the difference between the last column's
+  end and `ebcdic.record_length`.
+- Level-88 condition names and the numeric `OCCURS` index. The document schema
+  has no slot for either, and a custom field would be the same untyped bag the
+  columns were built to replace. Both are first-class on this collector's own
+  contract instead, in `FieldSchema.conditions` and `FieldSchema.occurs_index`,
+  and the column path carries the COBOL subscript that names the occurrence.
 - The trailer's counts. `ParseStatus` is folded last so the fold knows nothing
   else is coming, but its numbers are counts of the parse. A table's
   `ebcdic.rows` counts what is actually in that table, which is the number a

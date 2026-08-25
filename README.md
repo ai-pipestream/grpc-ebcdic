@@ -18,7 +18,7 @@ integers, and no value crosses the wire as a float or a JSON blob.
 
 ```bash
 cargo build --release          # protoc is the only non-Rust build dependency
-cargo test                     # 95 tests, no network, no fixture files
+cargo test                     # 110 tests, no network, no fixture files
 cargo clippy --all-targets     # pedantic, clean
 buf lint                       # STANDARD + COMMENTS, no comment ignores
 ./target/release/grpc-ebcdic   # listens on 0.0.0.0:50063
@@ -177,15 +177,44 @@ table. Each `TableItem` puts the field names in its first grid row with
 one record, cells aligned by field name; a `Decimal` cell carries `Decimal.text`
 character for character, never re-rendered and never a float.
 
+A grid of strings is not enough to work with, so each `TableData` also declares
+what is behind it:
+
+- `columns` is one `TableColumnSchema` per column, in layout order and
+  index-aligned with the grid, carrying the declared type
+  (`packed_decimal`, `zoned_decimal`, `integer`, `unsigned_integer`,
+  `string`), the picture clause, the byte offset and width inside the record
+  body, the COBOL level number, and the field's dotted qualification path
+  (`CUSTOMER-RECORD.ADDRESS.STREET`, an `OCCURS` expansion keeping its COBOL
+  subscript). A `FILLER` is still not a column, and does not need to be: it is
+  the gap the offsets leave between its neighbours.
+- `TableCell.value` is the cell's number when the field is numeric, beside the
+  `text` every reader already reads. The text stays the exact form, because a
+  scaled decimal is not generally representable in binary; the number is for
+  the consumer who has to compute rather than display.
+- `row_prov` is one `ProvenanceItem` per grid row carrying the record's
+  `ByteSpan` in the input, which is the only location a record has. The first
+  entry belongs to the header row, which was built from the copybook rather
+  than read from the input, and so carries no location at all.
+
+Level-88 condition names and the numeric `OCCURS` index have no home in the
+document schema; they ride the collector's own contract, in
+`FieldSchema.conditions` and `FieldSchema.occurs_index` on the `layout_info`
+event.
+
 Every item the fold creates carries
 `CollectorSource{collector: "ebcdic", model: <proto|json|copybook>, version:
-<crate version>}` and no `confidence`. There is no `prov`, no `bbox`, no
-`origin`, and no pages: this stream has byte offsets and a layout, not a page
-and not a filename. The layout facts live in `body.meta.custom_fields`
+<crate version>}` and no `confidence`. There is no `bbox`, no `origin`, and no
+pages: this stream has byte offsets and a layout, not a page and not a
+filename. A table carries no `prov` of its own either, because the records of
+one schema are interleaved with every other schema's and span no single range.
+The layout facts live in `body.meta.custom_fields`
 (`ebcdic.encoding`, `ebcdic.layout_source`, `ebcdic.header_size`,
 `ebcdic.footer_size`, `ebcdic.prefix_size`) and the per-schema facts in each
 table's `meta.custom_fields` (`ebcdic.schema`, `ebcdic.record_length`,
-`ebcdic.selector`, `ebcdic.rows`).
+`ebcdic.selector`, `ebcdic.rows`). `ebcdic.rows` now duplicates `num_rows` less
+the header row and is kept for one release; the rest have no first-class home
+in the document schema.
 
 `ebcdic.schema` deserves a note. A heading names a schema only when the layout
 has more than one, so a single-schema document would lose the name entirely.
@@ -299,11 +328,14 @@ Anything outside the subset is `UNIMPLEMENTED` and names the clause that did it,
 so a caller finds out their copybook needs hand-normalizing before they ship it
 rather than after a table of garbage arrives.
 
-Supported: levels 01 through 49 and 77 (88 condition names are skipped as
-storage-free), group items nested to any depth and flattened to leaves, `PIC
+Supported: levels 01 through 49 and 77 (88 condition names declare no storage,
+so they become the condition list of the item they follow), group items nested
+to any depth and flattened to leaves, each field keeping its level number and
+the dotted path of the groups above it, `PIC
 X`/`A` character items, `PIC 9` numerics with a leading `S` and one `V`, `USAGE
 DISPLAY`, `COMP-3`/`PACKED-DECIMAL`, `COMP`/`COMP-4`/`BINARY`, `OCCURS n` on an
-elementary item expanded to `NAME(1)` through `NAME(n)`, `FILLER` and anonymous
+elementary item expanded to `NAME(1)` through `NAME(n)`, each expansion keeping
+its one-based index and the name of the item it repeats, `FILLER` and anonymous
 items, the byte-neutral clauses (`VALUE`, `JUSTIFIED`, `BLANK WHEN ZERO`,
 `GLOBAL`, `EXTERNAL`), and both fixed-format card columns and free format.
 
@@ -402,7 +434,7 @@ grpc-ebcdic metrics: parses{started=12,completed=11,failed=1,rejected=0} records
 cargo test
 ```
 
-95 tests, none of which touch the network beyond localhost or the disk at all.
+110 tests, none of which touch the network beyond localhost or the disk at all.
 There are no fixture files: every record is assembled in the test from a
 copybook written as a string literal plus an EBCDIC encoder that writes zoned,
 packed, and binary fields from the COBOL definitions. A round trip is therefore
@@ -411,8 +443,9 @@ a real check rather than a comparison of one opaque blob to another.
 Mandatory cases, all present: truncated record, bad nibble in COMP-3,
 non-decimal zoned digit, three code pages over the same bytes, missing layout,
 control-character stripping on and off, byte cap, concurrency cap, unsupported
-copybook feature, malformed copybook, multi-schema selectors, header/footer, and
-the two anti-batch stream assertions.
+copybook feature, malformed copybook, multi-schema selectors, header/footer, the
+folded document's column declarations, typed cell values and per-row byte
+extents, and the two anti-batch stream assertions.
 
 The Document fold has its own: `src/document_fold.rs` drives real events from a
 real walk into the fold and asserts the flat body order (description, then
