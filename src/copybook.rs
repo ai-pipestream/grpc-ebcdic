@@ -40,7 +40,9 @@
 //! all is `INVALID_ARGUMENT`.
 
 use crate::error::ParseError;
-use crate::layout::{ConditionName, Declaration, FieldKind, RawField, RawLayout, RawRecord};
+use crate::layout::{
+    ConditionName, ConditionValue, Declaration, FieldKind, RawField, RawLayout, RawRecord,
+};
 
 /// Largest `OCCURS` count the compiler will expand.
 ///
@@ -482,8 +484,9 @@ fn parse_item(statement: &Statement) -> Result<Parsed, ParseError> {
 /// Parse one level-88 entry into the condition name it declares.
 ///
 /// The values are the literals of its `VALUE` clause with the quotes taken
-/// off, in declaration order, and a `THRU` range is kept as one value written
-/// `low THRU high` so that nothing about the declaration is invented or lost.
+/// off, in declaration order, and a `THRU` range is one value carrying both
+/// bounds so that nothing about the declaration is invented, lost, or left to
+/// be recovered from a joined string.
 fn condition_name(statement: &Statement, tokens: &[String]) -> Result<ConditionName, ParseError> {
     let Some(name) = statement.get(1) else {
         return Err(ParseError::invalid(
@@ -505,7 +508,7 @@ fn condition_name(statement: &Statement, tokens: &[String]) -> Result<ConditionN
         )));
     };
 
-    let mut values: Vec<String> = Vec::new();
+    let mut values: Vec<ConditionValue> = Vec::new();
     let mut range = false;
     for (index, token) in tokens.iter().enumerate().skip(start + 1) {
         match token.as_str() {
@@ -521,11 +524,14 @@ fn condition_name(statement: &Statement, tokens: &[String]) -> Result<ConditionN
             _ => {
                 let literal = unquote(&statement[index]);
                 if range {
-                    let low = values.pop().unwrap_or_default();
-                    values.push(format!("{low} THRU {literal}"));
+                    // The bound before the THRU becomes the low end of the
+                    // range it opened, rather than a value of its own.
+                    if let Some(open) = values.last_mut() {
+                        open.high = Some(literal);
+                    }
                     range = false;
                 } else {
-                    values.push(literal);
+                    values.push(ConditionValue::literal(literal));
                 }
             }
         }
@@ -854,7 +860,7 @@ fn describe_numeric(
 mod tests {
     use super::compile;
     use crate::error::ParseError;
-    use crate::layout::FieldKind;
+    use crate::layout::{ConditionName, ConditionValue, FieldKind};
 
     /// The worked example from the README, in fixed-format columns.
     const CUSTOMER: &str = "\
@@ -1113,17 +1119,53 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect();
+        let literal = |low: &str| ConditionValue::literal(low.to_string());
+        let range = |low: &str, high: &str| ConditionValue {
+            low: low.to_string(),
+            high: Some(high.to_string()),
+        };
         assert_eq!(
             conditions,
             vec![
                 vec![
-                    ("STATUS-OPEN", vec!["O".to_string()]),
-                    ("STATUS-CLOSED", vec!["C".to_string(), "X".to_string()]),
+                    ("STATUS-OPEN", vec![literal("O")]),
+                    ("STATUS-CLOSED", vec![literal("C"), literal("X")]),
                 ],
-                vec![("PASSING", vec!["1 THRU 3".to_string()])],
+                // The bounds stay apart and stay the copybook's own literals:
+                // the field is `PIC 9` but `1` and `3` are not turned into
+                // numbers, because the condition on the `PIC X` field above
+                // has no numbers to be turned into.
+                vec![("PASSING", vec![range("1", "3")])],
                 vec![],
             ]
         );
+    }
+
+    #[test]
+    fn a_condition_still_goes_out_flat_beside_its_typed_bounds() {
+        let record = &compile(
+            "01 REC.\n\
+             05 GRADE PIC 9.\n\
+             88 PASSING VALUE 1 THRU 3.\n\
+             88 EXACT VALUES ARE 5 7.\n",
+        )
+        .unwrap()
+        .records[0];
+        let conditions: Vec<_> = record.fields[0]
+            .declaration
+            .conditions
+            .iter()
+            .map(ConditionName::to_proto)
+            .collect();
+        // `ConditionName.values` is the duplicate kept for one release. Delete
+        // it from the wire and this fails, which is the point.
+        assert_eq!(conditions[0].values, vec!["1 THRU 3".to_string()]);
+        assert_eq!(conditions[1].values, vec!["5".to_string(), "7".to_string()]);
+        assert_eq!(conditions[0].ranges.len(), 1);
+        assert_eq!(conditions[0].ranges[0].low, "1");
+        assert_eq!(conditions[0].ranges[0].high.as_deref(), Some("3"));
+        assert_eq!(conditions[1].ranges.len(), 2);
+        assert_eq!(conditions[1].ranges[1].high, None);
     }
 
     #[test]

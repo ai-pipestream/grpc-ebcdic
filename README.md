@@ -18,7 +18,7 @@ integers, and no value crosses the wire as a float or a JSON blob.
 
 ```bash
 cargo build --release          # protoc is the only non-Rust build dependency
-cargo test                     # 110 tests, no network, no fixture files
+cargo test                     # 116 tests, no network, no fixture files
 cargo clippy --all-targets     # pedantic, clean
 buf lint                       # STANDARD + COMMENTS, no comment ignores
 ./target/release/grpc-ebcdic   # listens on 0.0.0.0:50063
@@ -184,10 +184,24 @@ what is behind it:
   index-aligned with the grid, carrying the declared type
   (`packed_decimal`, `zoned_decimal`, `integer`, `unsigned_integer`,
   `string`), the picture clause, the byte offset and width inside the record
-  body, the COBOL level number, and the field's dotted qualification path
+  body, the COBOL level number, the field's dotted qualification path
   (`CUSTOMER-RECORD.ADDRESS.STREET`, an `OCCURS` expansion keeping its COBOL
-  subscript). A `FILLER` is still not a column, and does not need to be: it is
-  the gap the offsets leave between its neighbours.
+  subscript), the occurrence as a number in `occurs_index`, and the field's
+  level-88 conditions in `conditions`. A `FILLER` is still not a column, and
+  does not need to be: it is the gap the offsets leave between its neighbours.
+- `conditions` is one `ValueCondition` per level-88 name, each holding one
+  `ValueRange` per literal: a bare `VALUE 'O'` is a range with `low` and no
+  `high`, a `VALUE 1 THRU 3` carries both bounds apart, and a
+  `VALUES ARE 'N' 'S' 'E'` is three ranges under the one name. The bounds are
+  the copybook's own literals, quotes stripped and nothing else done to them:
+  a condition on a `PIC 9` field is not silently turned into numbers, because
+  the one on the `PIC X` field beside it has no numbers to be turned into.
+- `record_layout` is the fixed-record layout the table was decoded with, as
+  typed numbers rather than stringly-typed metadata: the code page in
+  `encoding`, the schema's own `record_length`, the `header_bytes`,
+  `footer_bytes` and `prefix_bytes` trims, and `rows_truncated`. That last one
+  is always set and reads zero for a complete table, because an absent count is
+  not a claim that nothing was dropped.
 - `TableCell.value` is the cell's number when the field is numeric, beside the
   `text` every reader already reads. The text stays the exact form, because a
   scaled decimal is not generally representable in binary; the number is for
@@ -197,10 +211,14 @@ what is behind it:
   entry belongs to the header row, which was built from the copybook rather
   than read from the input, and so carries no location at all.
 
-Level-88 condition names and the numeric `OCCURS` index have no home in the
-document schema; they ride the collector's own contract, in
-`FieldSchema.conditions` and `FieldSchema.occurs_index` on the `layout_info`
-event.
+Level-88 condition names and the numeric `OCCURS` index also ride the
+collector's own contract, in `FieldSchema.conditions` and
+`FieldSchema.occurs_index` on the `layout_info` event, which is the lossless
+view and the one a client of the row stream reads.
+`ConditionName` carries each condition both ways: `ranges` keeps the bounds
+apart and is the truth, and `values` keeps the flat `A THRU C` spelling this
+field has always had. A joined string cannot say whether a literal contains the
+word `THRU` itself, so `values` is a duplicate kept for one release.
 
 Every item the fold creates carries
 `CollectorSource{collector: "ebcdic", model: <proto|json|copybook>, version:
@@ -208,13 +226,30 @@ Every item the fold creates carries
 pages: this stream has byte offsets and a layout, not a page and not a
 filename. A table carries no `prov` of its own either, because the records of
 one schema are interleaved with every other schema's and span no single range.
-The layout facts live in `body.meta.custom_fields`
-(`ebcdic.encoding`, `ebcdic.layout_source`, `ebcdic.header_size`,
-`ebcdic.footer_size`, `ebcdic.prefix_size`) and the per-schema facts in each
-table's `meta.custom_fields` (`ebcdic.schema`, `ebcdic.record_length`,
-`ebcdic.selector`, `ebcdic.rows`). `ebcdic.rows` now duplicates `num_rows` less
-the header row and is kept for one release; the rest have no first-class home
-in the document schema.
+The layout facts are typed, in every table's `data.record_layout`. They are
+also still written as the `ebcdic.*` custom fields they used to be, on
+`body.meta.custom_fields` and each table's `meta.custom_fields`, and those are
+duplicates kept for one release:
+
+| Custom field | Where it is written | Typed home |
+|---|---|---|
+| `ebcdic.encoding` | body | `data.record_layout.encoding` |
+| `ebcdic.header_size` | body | `data.record_layout.header_bytes` |
+| `ebcdic.footer_size` | body | `data.record_layout.footer_bytes` |
+| `ebcdic.prefix_size` | body | `data.record_layout.prefix_bytes` |
+| `ebcdic.record_length` | table | `data.record_layout.record_length` |
+| `ebcdic.rows_truncated` | table | `data.record_layout.rows_truncated` |
+| `ebcdic.rows` | table | `data.num_rows`, less the header row |
+| `ebcdic.layout_source` | body | `CollectorSource.model` |
+| `ebcdic.schema` | table | none: it stays a custom field |
+| `ebcdic.selector` | table | none: it stays a custom field |
+
+The one asymmetry is `ebcdic.rows_truncated`, which is written only when rows
+were dropped, as it always has been, while the typed
+`record_layout.rows_truncated` is always set and reads zero for a complete
+table. `the_deprecated_layout_custom_fields_are_still_emitted_beside_the_typed_ones`
+in `src/document_fold.rs` asserts both halves are written, so the window ends
+when someone deletes that test and not by accident.
 
 `ebcdic.schema` deserves a note. A heading names a schema only when the layout
 has more than one, so a single-schema document would lose the name entirely.
@@ -227,7 +262,7 @@ fold therefore caps itself at 100,000 rows per record schema. Rows past the cap
 are counted, not folded, and the trailer carries a
 `WARNING_CODE_DOCUMENT_ROWS_TRUNCATED` warning naming the schema, the dropped
 count, and the byte offset of the first dropped record, with the same count in
-that table's `meta.custom_fields["ebcdic.rows_truncated"]`. Nothing is capped
+that table's `data.record_layout.rows_truncated`. Nothing is capped
 silently. A caller who wants a whole Document sets `max_records` below the cap;
 a caller who wants every row reads the `record` events, which are never capped.
 
@@ -434,7 +469,7 @@ grpc-ebcdic metrics: parses{started=12,completed=11,failed=1,rejected=0} records
 cargo test
 ```
 
-110 tests, none of which touch the network beyond localhost or the disk at all.
+116 tests, none of which touch the network beyond localhost or the disk at all.
 There are no fixture files: every record is assembled in the test from a
 copybook written as a string literal plus an EBCDIC encoder that writes zoned,
 packed, and binary fields from the COBOL definitions. A round trip is therefore
@@ -451,8 +486,12 @@ The Document fold has its own: `src/document_fold.rs` drives real events from a
 real walk into the fold and asserts the flat body order (description, then
 heading and table per schema), the heading only when there is more than one
 schema, the skipping of a schema that matched no record, the header row, the
-exact decimal text, the source stamps, the custom fields, the row cap's warning
-and counter, and, every time, that `integrity_errors` is empty.
+exact decimal text, the source stamps, the typed `record_layout` (code page,
+record length, byte trims, and a truncation count that reads zero for a
+complete table), the level-88 conditions on the columns for a single literal, a
+`THRU` range and a list of literals, the row cap's warning and counter, the
+`ebcdic.*` custom fields still being emitted through their deprecation window,
+and, every time, that `integrity_errors` is empty.
 `tests/parse_stream.rs` proves the wire contract: the event order is exactly
 `layout_info, record..., document, status`, the document arrives once and only
 when asked for, and `emit_document = false` leaves the stream byte-identical to

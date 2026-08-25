@@ -1246,6 +1246,22 @@ async fn a_folded_document_carries_the_layout_facts_and_the_row_count() {
         !fields.contains_key("ebcdic.rows_truncated"),
         "nothing was dropped, so nothing claims to have been"
     );
+
+    // The same facts typed, which is where a reader should now go for them.
+    let declared = document.tables[0]
+        .data
+        .as_ref()
+        .unwrap()
+        .record_layout
+        .as_ref()
+        .expect("the table declares the layout it was decoded with");
+    assert_eq!(declared.encoding.as_deref(), Some("cp037"));
+    assert_eq!(declared.record_length, Some(4));
+    assert_eq!(declared.header_bytes, Some(8));
+    assert_eq!(declared.footer_bytes, Some(0));
+    assert_eq!(declared.prefix_bytes, Some(0));
+    assert_eq!(declared.rows_truncated, Some(0));
+
     assert!(
         parsed.status.warnings.is_empty(),
         "{:?}",
@@ -1467,21 +1483,66 @@ async fn the_layout_event_carries_condition_names_and_occurrences() {
             ("MONTH-TOTAL(2)", Some("MONTH-TOTAL"), Some(2)),
         ]
     );
-    // The document names them the way the copybook does.
-    let table = &parsed.document.expect("emit_document was set").tables[0];
+    // Beside the flat values, the same conditions with their bounds apart.
+    // The flat list is the duplicate kept for one release; the ranges are
+    // what a consumer should read.
     assert_eq!(
-        table
-            .data
-            .as_ref()
-            .unwrap()
-            .columns
+        fields[0]
+            .conditions
             .iter()
-            .map(|column| column.name.as_str())
+            .flat_map(|condition| condition.ranges.iter())
+            .map(|range| (range.low.as_str(), range.high.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![("O", None), ("C", None), ("X", None)]
+    );
+    // An occurrence knows which index it is and what it repeats, rather than
+    // leaving both inside a column name for a consumer to parse back out.
+    assert_eq!(
+        fields[1..]
+            .iter()
+            .map(|field| (
+                field.name.as_str(),
+                field.occurs_group.as_deref(),
+                field.occurs_index
+            ))
             .collect::<Vec<_>>(),
         vec![
-            "REC.STATUS-CODE",
-            "REC.MONTH-TOTAL(1)",
-            "REC.MONTH-TOTAL(2)"
+            ("MONTH-TOTAL(1)", Some("MONTH-TOTAL"), Some(1)),
+            ("MONTH-TOTAL(2)", Some("MONTH-TOTAL"), Some(2)),
         ]
     );
+    // The document names them the way the copybook does, and now carries both
+    // the conditions and the occurrence numbers itself.
+    let table = &parsed.document.expect("emit_document was set").tables[0];
+    let columns = &table.data.as_ref().unwrap().columns;
+    assert_eq!(
+        columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.occurs_index))
+            .collect::<Vec<_>>(),
+        vec![
+            ("REC.STATUS-CODE", None),
+            ("REC.MONTH-TOTAL(1)", Some(1)),
+            ("REC.MONTH-TOTAL(2)", Some(2)),
+        ]
+    );
+    assert_eq!(
+        columns[0]
+            .conditions
+            .iter()
+            .map(|condition| (
+                condition.name.as_str(),
+                condition
+                    .values
+                    .iter()
+                    .map(|range| (range.low.as_str(), range.high.as_deref()))
+                    .collect::<Vec<_>>()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("STATUS-OPEN", vec![("O", None)]),
+            ("STATUS-SHUT", vec![("C", None), ("X", None)]),
+        ]
+    );
+    assert!(columns[1].conditions.is_empty());
 }

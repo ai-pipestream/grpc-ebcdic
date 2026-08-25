@@ -30,7 +30,7 @@
 //!   decimals carried across as their exact canonical text.
 //!
 //! What the flat shape cannot say, the extended schema now can, and the fold
-//! fills all three in:
+//! fills all of it in:
 //!
 //! - `TableData.columns` is one
 //!   [`TableColumnSchema`](crate::proto::document::v1::TableColumnSchema) per
@@ -44,12 +44,22 @@
 //!   [`ProvenanceItem`](crate::proto::document::v1::ProvenanceItem) per grid
 //!   row carrying the record's byte extent, which is the only location a
 //!   record has.
+//! - `TableData.record_layout` is the fixed-record layout the table was
+//!   decoded with, typed: the code page, the record length, the header,
+//!   footer and prefix byte trims, and the number of rows the fold's own cap
+//!   dropped. Those facts used to be stringly-typed `ebcdic.*` custom fields
+//!   on the body and the table, which are still written for one release and
+//!   are no longer the truth.
+//! - `TableColumnSchema.conditions` is the level-88 condition names of the
+//!   column, each one a named list of literals and inclusive ranges with the
+//!   bounds apart and spelled the way the copybook spelled them.
+//!   `TableColumnSchema.occurs_index` is the `OCCURS` occurrence as a number,
+//!   beside the COBOL subscript the column path already carries.
 //!
-//! Two things the copybook declares still stop at this boundary, because the
-//! document schema has nowhere to put them: level-88 condition names and the
-//! `OCCURS` index as a number. Both are first-class on this collector's own
-//! contract, in `FieldSchema.conditions` and `FieldSchema.occurs_index`, and
-//! the column path carries the COBOL subscript that names the occurrence.
+//! Nothing the copybook declares stops at this boundary any more. The
+//! conditions still ride this collector's own contract too, in
+//! `FieldSchema.conditions`, which is the lossless view and the one a client
+//! of the row stream reads.
 //!
 //! One thing is deliberately kept past docling: every table carries its schema
 //! name in `meta.custom_fields["ebcdic.schema"]`. Upstream loses that name
@@ -157,6 +167,11 @@ pub struct DocumentFold {
     model: Option<String>,
     /// Rows folded per schema before the surplus is counted instead.
     row_cap: u64,
+    /// The parse-wide half of every table's `TableData.record_layout`: the
+    /// code page and the three byte trims, which the layout states once and
+    /// every schema decoded with it shares. The per-schema half, the record
+    /// length and the truncation count, is filled in as each table is written.
+    layout: doc::RecordLayoutMeta,
     /// Per-schema state, in layout order.
     tables: Vec<TableState>,
     /// Table state index by schema name.
@@ -193,6 +208,7 @@ impl DocumentFold {
             version: version.into(),
             model: None,
             row_cap: DEFAULT_ROW_CAP,
+            layout: doc::RecordLayoutMeta::default(),
             tables: Vec::new(),
             index_by_schema: BTreeMap::new(),
             description: String::new(),
@@ -308,11 +324,23 @@ impl DocumentFold {
             info.description.clone()
         };
 
-        // The body's five keys all still describe the parse rather than any one
-        // item, and the extended schema has grown no home for a source code
-        // page, a boundary width or a record prefix, so all five stay where
-        // they are. `ebcdic.layout_source` remains the duplicate it always was
-        // of `CollectorSource.model`.
+        // The code page and the three byte trims the layout states once. Every
+        // table decoded with this layout carries them typed, in
+        // `TableData.record_layout`, beside the record length only that schema
+        // knows.
+        self.layout = doc::RecordLayoutMeta {
+            encoding: Some(info.encoding.clone()),
+            record_length: None,
+            header_bytes: Some(u64::from(info.header_size)),
+            footer_bytes: Some(u64::from(info.footer_size)),
+            prefix_bytes: Some(u64::from(info.prefix_size)),
+            rows_truncated: None,
+        };
+
+        // Four of the body's five keys now have that typed home and are the
+        // duplicates kept for one release; `ebcdic.layout_source` remains the
+        // duplicate it always was of `CollectorSource.model`. See
+        // `table_custom_fields` for the window this repo is in.
         let mut custom_fields = HashMap::new();
         custom_fields.insert("ebcdic.encoding".to_string(), string_value(&info.encoding));
         if let Some(source) = self.model.clone() {
@@ -473,6 +501,15 @@ impl DocumentFold {
     fn add_table(&mut self, mut state: TableState) {
         let self_ref = format!("#/tables/{}", self.document.tables.len());
         let custom_fields = table_custom_fields(&state);
+        // The layout this table was decoded with, typed: the parse-wide code
+        // page and byte trims, this schema's own record length, and the count
+        // of what the row cap dropped. The count is always set, because zero
+        // is the answer to "was anything dropped" and not the absence of one.
+        let record_layout = doc::RecordLayoutMeta {
+            record_length: Some(u64::from(state.record_length)),
+            rows_truncated: Some(state.dropped),
+            ..self.layout.clone()
+        };
         let header: Vec<doc::TableCell> = state
             .columns
             .iter()
@@ -524,6 +561,7 @@ impl DocumentFold {
                 grid,
                 columns,
                 row_prov,
+                record_layout: Some(record_layout),
                 ..Default::default()
             }),
             source: vec![source],
@@ -550,8 +588,12 @@ impl DocumentFold {
                 model: self.model.clone(),
                 version: Some(self.version.clone()),
                 // Omitted on purpose: a copybook is a declaration and this
-                // mapping is deterministic, so a confidence would be noise.
+                // mapping is deterministic, so a confidence would be noise,
+                // and an uncalibrated signal behind a confidence that does not
+                // exist would be noise about noise.
                 confidence: None,
+                raw_score: None,
+                raw_score_kind: None,
             })),
         }
     }
@@ -569,14 +611,22 @@ impl DocumentFold {
 /// same day the fold starts filling it in:
 ///
 /// - `ebcdic.rows` duplicates `TableData.num_rows` less the header row.
+/// - `ebcdic.record_length` duplicates `record_layout.record_length`, and
+///   `ebcdic.rows_truncated` duplicates `record_layout.rows_truncated`. The
+///   typed count is always set and reads zero for a complete table; the custom
+///   field is written only when rows were dropped, which is what it has always
+///   done.
+/// - on the body, `ebcdic.encoding`, `ebcdic.header_size`,
+///   `ebcdic.footer_size` and `ebcdic.prefix_size` duplicate
+///   `record_layout.encoding`, `.header_bytes`, `.footer_bytes` and
+///   `.prefix_bytes` on every table.
 /// - the per-column facts these keys used to stand in for - the field type,
 ///   the picture, the byte offset and width, the level, the path - are now
 ///   `TableData.columns`, and the per-row byte offsets are
 ///   `TableData.row_prov`.
 ///
-/// `ebcdic.selector`, `ebcdic.record_length` and `ebcdic.rows_truncated` have
-/// no first-class home in the extended schema, so they stay custom fields
-/// rather than being dropped.
+/// `ebcdic.schema` and `ebcdic.selector` have no first-class home in the
+/// extended schema, so they stay custom fields rather than being dropped.
 fn table_custom_fields(state: &TableState) -> HashMap<String, Value> {
     let mut custom_fields = HashMap::new();
     custom_fields.insert("ebcdic.schema".to_string(), string_value(&state.name));
@@ -630,7 +680,40 @@ fn column(field: &pb::FieldSchema) -> Column {
             // Only a copybook has levels; the flat forms leave this unset
             // rather than claim an 01.
             level: field.level.and_then(|level| i32::try_from(level).ok()),
+            // The occurrence as a number, beside the COBOL subscript that
+            // `name` already carries in the path. Unset for a field that
+            // occurs once, which is not the same claim as occurrence one.
+            occurs_index: field
+                .occurs_index
+                .and_then(|index| i32::try_from(index).ok()),
+            // No display width: a fixed-record field has a width in bytes,
+            // which is `byte_size`, and no width on any page.
+            width: None,
+            conditions: field.conditions.iter().map(condition).collect(),
         },
+    }
+}
+
+/// One level-88 condition name as the document schema declares it.
+///
+/// The typed `ranges` of the collector's own event are the source, not the
+/// flat `values` beside them: a bare literal is a `ValueRange` with only
+/// `low`, a `VALUE low THRU high` keeps both bounds apart, and a condition
+/// with several literals is several ranges under the one name. The bounds stay
+/// the copybook's own literals, because a condition on a `PIC X` field has no
+/// numeric reading and one on a `PIC 9` field is still written the way the
+/// copybook wrote it.
+fn condition(declared: &pb::ConditionName) -> doc::ValueCondition {
+    doc::ValueCondition {
+        name: declared.name.clone(),
+        values: declared
+            .ranges
+            .iter()
+            .map(|range| doc::ValueRange {
+                low: range.low.clone(),
+                high: range.high.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -1066,6 +1149,17 @@ mod tests {
     /// The column declarations of a table.
     fn columns(table: &doc::TableItem) -> &[doc::TableColumnSchema] {
         &table.data.as_ref().unwrap().columns
+    }
+
+    /// The fixed-record layout a table declares it was decoded with.
+    fn record_layout(table: &doc::TableItem) -> &doc::RecordLayoutMeta {
+        table
+            .data
+            .as_ref()
+            .unwrap()
+            .record_layout
+            .as_ref()
+            .expect("every table this fold writes declares its record layout")
     }
 
     /// The byte extent one grid row reports, or `None` when it reports none.
@@ -1656,6 +1750,193 @@ mod tests {
     }
 
     #[test]
+    fn every_table_declares_the_record_layout_it_was_decoded_with() {
+        let mut layout = two_schema_layout();
+        layout.header_size = 3;
+        layout.footer_size = 5;
+        let mut data = b"HDR".to_vec();
+        data.extend(customer("JANE", [0x12, 0x34, 0x5d]));
+        data.extend(order("042"));
+        data.extend(b"TRAIL");
+        let document = fold(&options(layout), &data, DocumentFold::new(VERSION));
+
+        // Numbers, not the decimal strings a custom field would have had to
+        // carry them as, and the code page under its own name.
+        let customers = record_layout(&document.tables[0]);
+        assert_eq!(customers.encoding.as_deref(), Some("cp037"));
+        assert_eq!(customers.record_length, Some(9));
+        assert_eq!(customers.header_bytes, Some(3));
+        assert_eq!(customers.footer_bytes, Some(5));
+        assert_eq!(customers.prefix_bytes, Some(1));
+        // Nothing was dropped, and zero says so: the field is set either way,
+        // because an unset count is not a claim that a table is complete.
+        assert_eq!(customers.rows_truncated, Some(0));
+
+        // The trims are the layout's and every schema shares them; only the
+        // record length is the schema's own.
+        let orders = record_layout(&document.tables[1]);
+        assert_eq!(orders.record_length, Some(3));
+        assert_eq!(orders.encoding.as_deref(), Some("cp037"));
+        assert_eq!(orders.header_bytes, Some(3));
+        assert_eq!(orders.footer_bytes, Some(5));
+        assert_eq!(orders.prefix_bytes, Some(1));
+        assert_eq!(orders.rows_truncated, Some(0));
+    }
+
+    #[test]
+    fn a_layout_with_no_trims_declares_them_as_zero_rather_than_leaving_them_out() {
+        let document = fold(
+            &options(two_schema_layout()),
+            &customer("JANE", [0x12, 0x34, 0x5d]),
+            DocumentFold::new(VERSION),
+        );
+        let declared = record_layout(&document.tables[0]);
+        assert_eq!(declared.header_bytes, Some(0));
+        assert_eq!(declared.footer_bytes, Some(0));
+        // The record-type prefix is one byte even when nothing is trimmed at
+        // the file boundaries, and it is what stands between the record extent
+        // in `row_prov` and the byte offsets the columns declare.
+        assert_eq!(declared.prefix_bytes, Some(1));
+    }
+
+    #[test]
+    fn the_deprecated_layout_custom_fields_are_still_emitted_beside_the_typed_ones() {
+        let mut layout = two_schema_layout();
+        layout.header_size = 3;
+        layout.footer_size = 5;
+        let mut data = b"HDR".to_vec();
+        data.extend(customer("JANE", [0x12, 0x34, 0x5d]));
+        data.extend(b"TRAIL");
+        let document = fold(&options(layout), &data, DocumentFold::new(VERSION));
+
+        // The deprecation window: both halves are written this release, and
+        // they agree. Delete either half and this fails, which is how the
+        // window ends deliberately rather than by accident.
+        let body = document.body.as_ref().unwrap();
+        let fields = &body.meta.as_ref().unwrap().custom_fields;
+        let table = &document.tables[0];
+        let declared = record_layout(table);
+        assert_eq!(
+            custom_string(fields, "ebcdic.encoding"),
+            declared.encoding.clone().unwrap()
+        );
+        assert!(
+            (custom_number(fields, "ebcdic.header_size") - 3.0).abs() < f64::EPSILON
+                && declared.header_bytes == Some(3)
+        );
+        assert!(
+            (custom_number(fields, "ebcdic.footer_size") - 5.0).abs() < f64::EPSILON
+                && declared.footer_bytes == Some(5)
+        );
+        assert!(
+            (custom_number(fields, "ebcdic.prefix_size") - 1.0).abs() < f64::EPSILON
+                && declared.prefix_bytes == Some(1)
+        );
+
+        let fields = &table.meta.as_ref().unwrap().custom_fields;
+        assert!(
+            (custom_number(fields, "ebcdic.record_length") - 9.0).abs() < f64::EPSILON
+                && declared.record_length == Some(9)
+        );
+        // These two never had a typed home and are not deprecated with the
+        // rest: a schema name and a record selector are this collector's, not
+        // the document schema's.
+        assert_eq!(custom_string(fields, "ebcdic.schema"), "CUSTOMER");
+        assert_eq!(custom_string(fields, "ebcdic.selector"), "C");
+    }
+
+    #[test]
+    fn a_column_declares_the_level_88_conditions_of_the_field_behind_it() {
+        let options = pb::ParseOptions {
+            layout_source: Some(pb::parse_options::LayoutSource::Copybook(
+                "01 REC.\n\
+                 05 STATUS-CODE PIC X.\n\
+                 88 STATUS-OPEN VALUE 'O'.\n\
+                 05 GRADE PIC 9.\n\
+                 88 PASSING VALUE 1 THRU 3.\n\
+                 05 REGION PIC X.\n\
+                 88 DOMESTIC VALUES ARE 'N' 'S' 'E'.\n\
+                 05 PLAIN PIC X.\n"
+                    .into(),
+            )),
+            ..Default::default()
+        };
+        let document = fold(
+            &options,
+            &Codec::resolve("cp037").unwrap().encode("O2NX").unwrap(),
+            DocumentFold::new(VERSION),
+        );
+        let declared = columns(&document.tables[0]);
+
+        // One literal: a range with a low bound and no high one. `high` unset
+        // is the difference between "equals O" and "anything from O upwards".
+        assert_eq!(declared[0].conditions.len(), 1);
+        assert_eq!(declared[0].conditions[0].name, "STATUS-OPEN");
+        assert_eq!(declared[0].conditions[0].values.len(), 1);
+        assert_eq!(declared[0].conditions[0].values[0].low, "O");
+        assert_eq!(declared[0].conditions[0].values[0].high, None);
+
+        // THRU: one range carrying both bounds, still spelled the way the
+        // copybook spelled them even though the field is numeric.
+        assert_eq!(declared[1].conditions[0].name, "PASSING");
+        assert_eq!(declared[1].conditions[0].values.len(), 1);
+        assert_eq!(declared[1].conditions[0].values[0].low, "1");
+        assert_eq!(
+            declared[1].conditions[0].values[0].high.as_deref(),
+            Some("3")
+        );
+
+        // Several literals: several ranges under the one condition name, in
+        // declaration order, rather than one joined string.
+        assert_eq!(declared[2].conditions[0].name, "DOMESTIC");
+        assert_eq!(
+            declared[2]
+                .conditions
+                .iter()
+                .flat_map(|condition| condition.values.iter())
+                .map(|range| (range.low.as_str(), range.high.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![("N", None), ("S", None), ("E", None)]
+        );
+
+        // A field with no level-88 under it declares no conditions, which is
+        // not the same as declaring an empty one.
+        assert!(declared[3].conditions.is_empty());
+    }
+
+    #[test]
+    fn an_occurs_column_declares_its_occurrence_as_a_number() {
+        let options = pb::ParseOptions {
+            layout_source: Some(pb::parse_options::LayoutSource::Copybook(
+                "01 REC.\n05 NAME PIC X(2).\n05 MONTH PIC 9(2) OCCURS 3.\n".into(),
+            )),
+            ..Default::default()
+        };
+        let document = fold(
+            &options,
+            &Codec::resolve("cp037").unwrap().encode("AB010203").unwrap(),
+            DocumentFold::new(VERSION),
+        );
+        let declared = columns(&document.tables[0]);
+        assert_eq!(
+            declared
+                .iter()
+                .map(|column| (column.name.as_str(), column.occurs_index))
+                .collect::<Vec<_>>(),
+            vec![
+                // A field that occurs once is not occurrence one.
+                ("REC.NAME", None),
+                ("REC.MONTH(1)", Some(1)),
+                ("REC.MONTH(2)", Some(2)),
+                ("REC.MONTH(3)", Some(3)),
+            ]
+        );
+        // A byte width is not a display width, and this collector has no page
+        // to measure one on.
+        assert!(declared.iter().all(|column| column.width.is_none()));
+    }
+
+    #[test]
     fn rows_past_the_cap_are_counted_warned_about_and_left_out() {
         let mut data = Vec::new();
         for name in ["AAAA", "BBBB", "CCCC", "DDDD"] {
@@ -1703,10 +1984,16 @@ mod tests {
         assert_eq!(data_.row_prov.len(), data_.grid.len());
         assert_eq!(row_span(table, 1), Some((0, 10)));
         assert_eq!(row_span(table, 2), Some((10, 20)));
+        // The typed count is the truth: two rows dropped, as a number.
+        assert_eq!(record_layout(table).rows_truncated, Some(2));
         let fields = &table.meta.as_ref().unwrap().custom_fields;
         assert!((custom_number(fields, "ebcdic.rows") - 2.0).abs() < f64::EPSILON);
+        // Still written beside it for one release, and still only when rows
+        // were actually dropped, which is what this key has always meant.
         assert!((custom_number(fields, "ebcdic.rows_truncated") - 2.0).abs() < f64::EPSILON);
-        // The other schema is under the cap and says nothing about it.
+        // The other schema is under the cap. The typed count says so with a
+        // zero; the custom field says so by being absent.
+        assert_eq!(record_layout(&document.tables[1]).rows_truncated, Some(0));
         let fields = &document.tables[1].meta.as_ref().unwrap().custom_fields;
         assert!(!fields.contains_key("ebcdic.rows_truncated"));
         assert_eq!(row_text(&document.tables[1], 1), vec!["7"]);

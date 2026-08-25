@@ -98,6 +98,50 @@ impl FieldKind {
     }
 }
 
+/// One literal or one inclusive range of a level-88 `VALUE` clause.
+///
+/// The bounds stay the copybook's own literals, quotes stripped and nothing
+/// else done to them. Coercing `PIC 9` bounds to numbers would make the type
+/// of a condition depend on the field it qualifies, and a `PIC X` bound has no
+/// number to be coerced to at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionValue {
+    /// The literal, or the low bound of a `THRU` range.
+    pub low: String,
+    /// The high bound, set only for a `VALUE low THRU high` range.
+    pub high: Option<String>,
+}
+
+impl ConditionValue {
+    /// One bare literal.
+    #[must_use]
+    pub const fn literal(low: String) -> Self {
+        Self { low, high: None }
+    }
+
+    /// The flat string this value has always been written as on the wire.
+    ///
+    /// A range joins its bounds with ` THRU `, which is the form
+    /// `ConditionName.values` carries and the reason that field cannot be
+    /// parsed back: a literal is allowed to contain the word itself.
+    #[must_use]
+    pub fn to_flat(&self) -> String {
+        self.high.as_ref().map_or_else(
+            || self.low.clone(),
+            |high| format!("{} THRU {high}", self.low),
+        )
+    }
+
+    /// The protobuf view of this value.
+    #[must_use]
+    pub fn to_proto(&self) -> pb::ConditionValue {
+        pb::ConditionValue {
+            low: self.low.clone(),
+            high: self.high.clone(),
+        }
+    }
+}
+
 /// One COBOL level-88 condition name and the values that make it true.
 ///
 /// A copybook has no other way to declare which values of a field are legal,
@@ -107,16 +151,20 @@ pub struct ConditionName {
     /// The condition name as it was declared.
     pub name: String,
     /// Values of the parent field the condition is true for.
-    pub values: Vec<String>,
+    pub values: Vec<ConditionValue>,
 }
 
 impl ConditionName {
     /// The protobuf view of this condition name.
+    ///
+    /// Both views of the same values: `ranges` keeps the bounds apart, and
+    /// `values` keeps the flat spelling for one more release.
     #[must_use]
     pub fn to_proto(&self) -> pb::ConditionName {
         pb::ConditionName {
             name: self.name.clone(),
-            values: self.values.clone(),
+            values: self.values.iter().map(ConditionValue::to_flat).collect(),
+            ranges: self.values.iter().map(ConditionValue::to_proto).collect(),
         }
     }
 }

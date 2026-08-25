@@ -3,6 +3,7 @@ syntax = "proto3";
 package ai.pipestream.document.v1;
 
 import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
 
 option java_multiple_files = true;
 option java_outer_classname = "DocumentProto";
@@ -113,6 +114,17 @@ message Document {
 
   // Media stream metadata for audio and video sources.
   optional MediaMeta media = 21;
+
+  // Tracked changes the source records (insertions, deletions, format
+  // edits), each anchored to the content it touches.
+  repeated ChangeRecord changes = 22;
+
+  // Named anchors the source declares (bookmarks, reference marks), the
+  // targets its own cross-references point at.
+  repeated NamedAnchor anchors = 23;
+
+  // Message envelope for mail sources.
+  optional EmailMeta email = 24;
 }
 
 // DocumentOrigin contains metadata about the source document file.
@@ -236,6 +248,11 @@ message CollectorSource {
   // The producer's confidence in this item, 0.0 to 1.0, when the engine
   // reports one.
   optional double confidence = 4;
+  // The engine's own uncalibrated signal behind that confidence, verbatim,
+  // with its kind named (avg_logprob, softmax, distance) so consumers never
+  // mistake it for a probability.
+  optional double raw_score = 5;
+  optional string raw_score_kind = 6;
 }
 
 // SourceType is a union of possible source descriptors.
@@ -672,6 +689,10 @@ message TextItemBase {
 
   // Raw label fallback for forward-compatibility with newer label vocabularies.
   optional string label_raw = 16;
+
+  // The source's own named style for the item (a word processor's
+  // paragraph style), verbatim; extension beyond the upstream dialect.
+  optional string style_name = 17;
 }
 
 // TitleItem represents a document title or major heading.
@@ -1087,6 +1108,9 @@ message TableData {
   // Per-row provenance for record-oriented sources (byte ranges, grid
   // rows); extension beyond the upstream dialect.
   repeated ProvenanceItem row_prov = 8;
+  // The fixed-record layout this table was decoded with; extension beyond
+  // the upstream dialect.
+  optional RecordLayoutMeta record_layout = 10;
 }
 
 // TableRow represents a single row in the table.
@@ -1230,6 +1254,25 @@ message PageItem {
   Size size = 1;
   optional ImageRef image = 2;
   int32 page_no = 3;
+  // The coordinate unit this page's size and its items' boxes are measured
+  // in (px, pt, twip); unset keeps the producer's historical space.
+  // Extension beyond the upstream dialect.
+  optional string unit = 4;
+  // Extraction diagnostics for the page, when the producer measures them.
+  optional PageQuality quality = 5;
+}
+
+// PageQuality carries a page's extraction diagnostics as the measurements
+// they are, not booleans.
+message PageQuality {
+  // Letter-frequency garble score for the page's text layer, 0.0 clean.
+  optional double garble_score = 1;
+  // Count of replacement-character runs in the text layer.
+  optional int32 replacement_runs = 2;
+  // The producer's verdict that raster OCR would beat this text layer.
+  optional bool ocr_recommended = 3;
+  // Rotation the producer detected and applied, degrees clockwise.
+  optional double rotation_degrees = 4;
 }
 
 // ============================================================================
@@ -1280,22 +1323,39 @@ message InlineSpan {
   optional string hyperlink = 3;
   // Internal cross-reference target (footnote, citation, section).
   optional FineRef target = 4;
+  // Character-run attributes beyond the boolean set: the source's font
+  // family and size (points), text color as #rrggbb, and the run's own
+  // language tag when it differs from the item's.
+  optional string font_family = 5;
+  optional double font_size_pt = 6;
+  optional string color = 7;
+  optional string language = 8;
+  // The source field code a generated run came from (a page number, a
+  // date, a cross-reference), so resolved field text stays distinguishable
+  // from authored text.
+  optional string field_code = 9;
 }
 
 // DocumentMeta carries the metadata the source declares about itself.
 message DocumentMeta {
   optional string title = 1;
   repeated string authors = 2;
-  // ISO 8601 timestamps, verbatim from the source.
-  optional string created = 3;
-  optional string modified = 4;
+  // Creation and modification instants. The typed field carries the parsed
+  // instant; the _raw twin keeps the source's own spelling and is the only
+  // field set when the source's value does not parse.
+  optional google.protobuf.Timestamp created = 3;
+  optional google.protobuf.Timestamp modified = 4;
   // BCP 47 language tag.
   optional string language = 5;
   // The software that produced the source file.
   optional string generator = 6;
   repeated string keywords = 7;
-  // Source metadata with no first-class slot, keyed by a producer-scoped
-  // name.
+  // The schema the source declares for itself (an XML xsi:schemaLocation).
+  optional string schema_location = 8;
+  optional string created_raw = 9;
+  optional string modified_raw = 10;
+  // Source metadata that is genuinely open vocabulary. Data whose shape the
+  // fleet knows gets a typed field, never an entry here.
   map<string, string> extra = 100;
 }
 
@@ -1305,8 +1365,9 @@ message CellValue {
   oneof kind {
     double number = 1;
     bool boolean = 2;
-    // ISO 8601 date or datetime, verbatim.
-    string datetime = 3;
+    // The parsed date or datetime, timezone-honest: spreadsheet dates are
+    // civil values, not instants.
+    CivilDateTime datetime = 3;
     // The source formula, in the source's own syntax.
     string formula = 4;
     // The source's error literal (a spreadsheet #DIV/0!, a conversion
@@ -1315,6 +1376,20 @@ message CellValue {
   }
   // The source's display format string for the value.
   optional string number_format = 10;
+}
+
+// CivilDateTime is a wall-clock date or datetime as the source wrote it,
+// without inventing a timezone the source never stated.
+message CivilDateTime {
+  int32 year = 1;
+  int32 month = 2;
+  int32 day = 3;
+  optional int32 hour = 4;
+  optional int32 minute = 5;
+  optional int32 second = 6;
+  optional int32 nanos = 7;
+  // Only when the source itself states an offset.
+  optional int32 utc_offset_minutes = 8;
 }
 
 // TableColumnSchema declares one column of a schema-carrying table
@@ -1329,6 +1404,14 @@ message TableColumnSchema {
   optional uint64 byte_size = 5;
   // Copybook level number.
   optional int32 level = 6;
+  // One-based occurrence for a column inside an OCCURS group; unset for
+  // columns that occur once.
+  optional int32 occurs_index = 7;
+  // The column's display width in the page unit, when the source declares
+  // one.
+  optional double width = 9;
+  // Named value conditions declared on the column (copybook level-88).
+  repeated ValueCondition conditions = 8;
 }
 
 // SubDocumentRef registers one nested payload the source carries (a mail
@@ -1350,12 +1433,15 @@ message WebMeta {
   optional string target_uri = 1;
   // The page's self-declared canonical URI.
   optional string canonical_uri = 2;
-  // ISO 8601 capture time.
-  optional string crawl_time = 3;
+  // Capture instant; the _raw twin keeps the source's spelling and is the
+  // only field set when it does not parse.
+  optional google.protobuf.Timestamp crawl_time = 3;
   optional int32 http_status = 4;
   optional string content_language = 5;
-  // Selected response headers, lower-cased names.
+  // Response headers, lower-cased names. Header names are an open
+  // vocabulary; the map is the honest type here.
   map<string, string> headers = 6;
+  optional string crawl_time_raw = 7;
 }
 
 // MetaTag is one page-level name/content meta pair.
@@ -1399,6 +1485,82 @@ message OutlineEntry {
   optional int32 page_no = 3;
   // The item or destination the entry points at, when resolvable.
   optional FineRef target = 4;
+}
+
+// ChangeRecord is one tracked change the source records.
+message ChangeRecord {
+  // Stable id within the document, as the source names it.
+  string id = 1;
+  // The change kind in the source's own vocabulary (insert, delete,
+  // format), lower-cased.
+  string kind = 2;
+  string author = 3;
+  // The change instant; the _raw twin keeps the source's spelling and is
+  // the only field set when it does not parse.
+  optional google.protobuf.Timestamp timestamp = 4;
+  // The item and span the change touches.
+  optional FineRef target = 5;
+  // The text the change removed or replaced, when the source keeps it.
+  optional string content = 6;
+  optional string timestamp_raw = 7;
+}
+
+// NamedAnchor is one named position the source declares.
+message NamedAnchor {
+  string name = 1;
+  FineRef target = 2;
+}
+
+// ValueRange is one literal or literal range in a value condition; the
+// bounds are the source's own literals.
+message ValueRange {
+  string low = 1;
+  optional string high = 2;
+}
+
+// ValueCondition is one named value condition a column declares.
+message ValueCondition {
+  string name = 1;
+  repeated ValueRange values = 2;
+}
+
+// EmailParty is one addressee, split as the source states it.
+message EmailParty {
+  optional string name = 1;
+  string address = 2;
+}
+
+// EmailMeta is the typed message envelope of a mail source.
+message EmailMeta {
+  repeated EmailParty from = 1;
+  repeated EmailParty to = 2;
+  repeated EmailParty cc = 3;
+  repeated EmailParty bcc = 4;
+  optional string message_id = 5;
+  // Every id the reply header names, individually.
+  repeated string in_reply_to = 6;
+  // Every id from every References header instance, in order.
+  repeated string references = 7;
+  optional string conversation_topic = 8;
+  // The source's conversation index, verbatim bytes.
+  optional bytes conversation_index = 9;
+  // The sent instant; the _raw twin keeps the source's spelling and is the
+  // only field set when it does not parse.
+  optional google.protobuf.Timestamp sent = 10;
+  optional string sent_raw = 11;
+}
+
+// RecordLayoutMeta describes the fixed-record layout a table was decoded
+// with.
+message RecordLayoutMeta {
+  // The source byte encoding (an EBCDIC code page name).
+  optional string encoding = 1;
+  optional uint64 record_length = 2;
+  optional uint64 header_bytes = 3;
+  optional uint64 footer_bytes = 4;
+  optional uint64 prefix_bytes = 5;
+  // Rows the producer's row cap dropped; zero means the table is complete.
+  optional uint64 rows_truncated = 6;
 }
 
 // BarcodeAnnotation is one decoded machine-readable code payload.

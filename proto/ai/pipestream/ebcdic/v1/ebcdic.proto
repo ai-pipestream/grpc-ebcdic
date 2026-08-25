@@ -240,18 +240,36 @@ message Cell {
   }
 }
 
+// ConditionValue is one literal or one inclusive range of a level-88 VALUE
+// clause. The bounds are the copybook's own literals with the quotes taken
+// off, never coerced to numbers: a `PIC X` condition and a `PIC 9` condition
+// are both written the way the copybook wrote them.
+message ConditionValue {
+  // The literal, or the low bound of a `THRU` range.
+  string low = 1;
+
+  // The high bound, set only for a `VALUE low THRU high` range.
+  optional string high = 2;
+}
+
 // ConditionName is one COBOL level-88 condition name: a label and the values
 // of its parent field that make it true.
-//
-// A range written `VALUE 'A' THRU 'C'` arrives as the single value
-// `A THRU C`; every other literal arrives on its own, quotes stripped.
 message ConditionName {
   // The condition name as the copybook declared it.
   string name = 1;
 
   // Values of the parent field the condition is true for, in declaration
-  // order.
+  // order, as the flat strings this field has always carried: a range written
+  // `VALUE 'A' THRU 'C'` as the single value `A THRU C`, every other literal
+  // on its own with the quotes stripped.
+  //
+  // A joined string cannot say whether a literal contains the word THRU
+  // itself, so `ranges` is the truth and this field is the duplicate kept for
+  // one release so that no reader breaks on the day the typed twin lands.
   repeated string values = 2;
+
+  // The same values, one entry per literal or range, with the bounds apart.
+  repeated ConditionValue ranges = 3;
 }
 
 // FieldSchema is one field of a record schema as the server resolved it,

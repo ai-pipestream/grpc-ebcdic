@@ -75,7 +75,7 @@ from the collector itself:
 - The bound is a per-schema row cap (100,000). Past it rows are counted, not
   folded, and the trailer carries `WARNING_CODE_DOCUMENT_ROWS_TRUNCATED`
   naming the schema and the dropped count, with the same count in the table's
-  `meta.custom_fields["ebcdic.rows_truncated"]`. There is no silent cap. Pair
+  `data.record_layout.rows_truncated`. There is no silent cap. Pair
   `emit_document` with `max_records` for a whole Document. Dropping rows is
   not the same as matching none: a schema whose rows were all dropped still
   gets its table, carrying the count that says so, while a schema the input
@@ -93,7 +93,7 @@ siblings of those headings rather than children. Everything hangs off
 | `schema_name` | the pipestream document schema v2 identifier |
 | `name` | `LayoutInfo.description`, else the first schema name |
 | `origin` | unset: the stream carries bytes and a layout, never a filename or a media type |
-| `body.meta.custom_fields` | `ebcdic.encoding`, `ebcdic.layout_source`, `ebcdic.header_size`, `ebcdic.footer_size`, `ebcdic.prefix_size` |
+| `body.meta.custom_fields` | `ebcdic.layout_source`, plus `ebcdic.encoding`, `ebcdic.header_size`, `ebcdic.footer_size` and `ebcdic.prefix_size` as duplicates of `record_layout`, kept for one release |
 | `groups` | empty: this mapping uses none |
 | one `TextItem` (`TEXT`) | the layout description, when there is one, first on `#/body` |
 | one `SectionHeaderItem` per record schema | the schema name, level 1, on `#/body`, only when the layout declares more than one schema |
@@ -101,9 +101,11 @@ siblings of those headings rather than children. Everything hangs off
 | a schema that matched no record | nothing at all: no heading, no table |
 | one grid row per `RecordRow` | cells aligned by name against the schema's fields; `text` verbatim, `Decimal` as `Decimal.text` exactly, `integer` as its decimal string |
 | `TableCell.value` | the cell's number when the field is numeric, beside the rendering in `text`; a character field has none |
-| `TableData.columns` | one `TableColumnSchema` per column in layout order: declared type, picture clause, byte offset and width in the record body, COBOL level, and the dotted qualification path with its `OCCURS` subscript |
+| `TableData.columns` | one `TableColumnSchema` per column in layout order: declared type, picture clause, byte offset and width in the record body, COBOL level, the dotted qualification path with its `OCCURS` subscript, the occurrence as `occurs_index`, and the level-88 `conditions` |
+| `TableColumnSchema.conditions` | one `ValueCondition` per level-88 name; one `ValueRange` per literal, `low` alone for a bare `VALUE`, `low` and `high` for a `THRU`, several ranges for several literals, all keeping the copybook's own literals |
+| `TableData.record_layout` | the code page, the schema's record length, the header, footer and prefix byte trims, and the rows the cap dropped, as typed numbers |
 | `TableData.row_prov` | one entry per grid row carrying the record's `ByteSpan` in the input; the header row's entry carries no location, because the header came from the copybook and not from the input |
-| `table.meta.custom_fields` | `ebcdic.schema`, `ebcdic.record_length`, `ebcdic.selector` (when the layout has one), `ebcdic.rows`, `ebcdic.rows_truncated` (only when rows were dropped) |
+| `table.meta.custom_fields` | `ebcdic.schema` and `ebcdic.selector` (when the layout has one), plus `ebcdic.record_length`, `ebcdic.rows` and `ebcdic.rows_truncated` (only when rows were dropped) as duplicates of the typed fields, kept for one release |
 | `CollectorSource` on every item | `collector = "ebcdic"`, `model` = the layout form (`proto` / `json` / `copybook`), `version` = the server's crate version |
 
 One field goes past the minimum: `table.meta.custom_fields["ebcdic.schema"]`
@@ -128,15 +130,17 @@ self-describing without changing the item shape.
   in the table; the bytes are consumed and that is all. Nothing is hidden by
   it: a filler is the gap between the byte offsets of the columns on either
   side of it, and a trailing one is the difference between the last column's
-  end and `ebcdic.record_length`.
-- Level-88 condition names and the numeric `OCCURS` index. The document schema
-  has no slot for either, and a custom field would be the same untyped bag the
-  columns were built to replace. Both are first-class on this collector's own
-  contract instead, in `FieldSchema.conditions` and `FieldSchema.occurs_index`,
-  and the column path carries the COBOL subscript that names the occurrence.
+  end and `record_layout.record_length`.
+- Nothing about the copybook, any more. Level-88 condition names and the
+  numeric `OCCURS` index were the two the document schema had no slot for;
+  `TableColumnSchema.conditions` and `TableColumnSchema.occurs_index` are those
+  slots. Both are still first-class on this collector's own contract as well,
+  in `FieldSchema.conditions` and `FieldSchema.occurs_index`, which is the
+  lossless view, and the column path still carries the COBOL subscript that
+  names the occurrence.
 - The trailer's counts. `ParseStatus` is folded last so the fold knows nothing
   else is coming, but its numbers are counts of the parse. A table's
-  `ebcdic.rows` counts what is actually in that table, which is the number a
+  `num_rows` counts what is actually in that table, which is the number a
   reader of the Document can check.
 
 The fold ships an integrity checker (`document_fold::integrity_errors`, the
