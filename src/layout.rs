@@ -98,6 +98,50 @@ impl FieldKind {
     }
 }
 
+/// One COBOL level-88 condition name and the values that make it true.
+///
+/// A copybook has no other way to declare which values of a field are legal,
+/// so this is the closest thing to an enumeration the layout can carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionName {
+    /// The condition name as it was declared.
+    pub name: String,
+    /// Values of the parent field the condition is true for.
+    pub values: Vec<String>,
+}
+
+impl ConditionName {
+    /// The protobuf view of this condition name.
+    #[must_use]
+    pub fn to_proto(&self) -> pb::ConditionName {
+        pb::ConditionName {
+            name: self.name.clone(),
+            values: self.values.clone(),
+        }
+    }
+}
+
+/// What a copybook says about a field beyond the bytes it occupies: where it
+/// sits in the level tree, which occurrence of a repeating item it is, and the
+/// condition names declared under it.
+///
+/// Empty for the protobuf and JSON layout forms, which describe a flat field
+/// list with no hierarchy: those set only [`Declaration::path`], to the field
+/// name, so a consumer never has to special-case the flat forms.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Declaration {
+    /// COBOL level number of the item, when the source had levels.
+    pub level: Option<u32>,
+    /// Dotted qualification path, record name first.
+    pub path: String,
+    /// One-based occurrence index of an `OCCURS` expansion.
+    pub occurs_index: Option<u32>,
+    /// Unsubscripted name of the repeating item.
+    pub occurs_group: Option<String>,
+    /// Level-88 condition names declared under the field.
+    pub conditions: Vec<ConditionName>,
+}
+
 /// One fixed-width field, with its offset already resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
@@ -113,6 +157,8 @@ pub struct Field {
     pub scale: u32,
     /// Original COBOL picture clause, for diagnostics.
     pub picture: String,
+    /// What the source declaration said beyond the bytes.
+    pub declaration: Declaration,
 }
 
 impl Field {
@@ -126,6 +172,16 @@ impl Field {
             r#type: self.kind.to_proto() as i32,
             scale: self.scale,
             picture: self.picture.clone(),
+            level: self.declaration.level,
+            path: self.declaration.path.clone(),
+            occurs_index: self.declaration.occurs_index,
+            occurs_group: self.declaration.occurs_group.clone(),
+            conditions: self
+                .declaration
+                .conditions
+                .iter()
+                .map(ConditionName::to_proto)
+                .collect(),
         }
     }
 }
@@ -227,6 +283,8 @@ pub(crate) struct RawField {
     pub(crate) picture: String,
     /// Explicit offset, when the source carried one.
     pub(crate) offset: Option<u32>,
+    /// Levels, paths, occurrences and conditions, when the source had them.
+    pub(crate) declaration: Declaration,
 }
 
 /// A record as it arrives.
@@ -298,6 +356,9 @@ fn from_proto(layout: &pb::EbcdicLayout) -> RawLayout {
             scale: field.scale,
             picture: field.picture.clone(),
             offset: field.offset,
+            // A protobuf layout is a flat field list: no levels, no groups, no
+            // OCCURS. Validation fills the path in from the name.
+            declaration: Declaration::default(),
         }
     }
     RawLayout {
@@ -385,6 +446,8 @@ impl From<JsonField> for RawField {
             scale: field.scale,
             picture: field.picture.unwrap_or_default(),
             offset: field.offset,
+            // Same flat shape as the protobuf form.
+            declaration: Declaration::default(),
         }
     }
 }
@@ -478,17 +541,22 @@ fn prefix_field(raw: RawField, role: &str) -> Result<Field, ParseError> {
         )));
     }
     check_width(&raw, role)?;
+    let name = if raw.name.is_empty() {
+        role.to_string()
+    } else {
+        raw.name
+    };
     Ok(Field {
-        name: if raw.name.is_empty() {
-            role.to_string()
-        } else {
-            raw.name
-        },
         offset: 0,
         size: raw.size,
         kind: raw.kind,
         scale: raw.scale,
         picture: raw.picture,
+        declaration: Declaration {
+            path: name.clone(),
+            ..raw.declaration
+        },
+        name,
     })
 }
 
@@ -623,6 +691,13 @@ fn validate(raw: RawLayout, source: pb::LayoutSource) -> Result<Layout, ParseErr
                     raw_field.name, raw_field.scale
                 )));
             }
+            // A flat layout form declares no path, so the field name is the
+            // whole of it: a consumer reads `path` without asking which form
+            // the layout arrived in.
+            let mut declaration = raw_field.declaration;
+            if declaration.path.is_empty() {
+                declaration.path.clone_from(&raw_field.name);
+            }
             fields.push(Field {
                 name: raw_field.name,
                 offset,
@@ -630,6 +705,7 @@ fn validate(raw: RawLayout, source: pb::LayoutSource) -> Result<Layout, ParseErr
                 kind: raw_field.kind,
                 scale: raw_field.scale,
                 picture: raw_field.picture,
+                declaration,
             });
         }
         debug_assert!(!fields.is_empty(), "checked above");
@@ -714,6 +790,29 @@ mod tests {
             vec![(0, 8), (8, 5), (13, 3)]
         );
         assert_eq!(record.fields[2].kind, FieldKind::Skip);
+    }
+
+    #[test]
+    fn a_flat_layout_form_still_gives_every_field_a_path() {
+        // The protobuf and JSON forms have no groups and no levels, so a
+        // consumer of the schema reads `path` unconditionally and gets the
+        // field name when that is all there is.
+        let layout = resolve(&options(sample_layout())).expect("valid layout");
+        let record = &layout.records[0];
+        assert_eq!(
+            record
+                .fields
+                .iter()
+                .map(|f| f.declaration.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["NAME", "BALANCE", ""]
+        );
+        assert!(
+            record.fields.iter().all(|f| f.declaration.level.is_none()
+                && f.declaration.occurs_index.is_none()
+                && f.declaration.conditions.is_empty()),
+            "a flat form declares no hierarchy and must not invent one"
+        );
     }
 
     #[test]

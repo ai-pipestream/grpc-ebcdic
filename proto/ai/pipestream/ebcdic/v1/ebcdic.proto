@@ -240,6 +240,20 @@ message Cell {
   }
 }
 
+// ConditionName is one COBOL level-88 condition name: a label and the values
+// of its parent field that make it true.
+//
+// A range written `VALUE 'A' THRU 'C'` arrives as the single value
+// `A THRU C`; every other literal arrives on its own, quotes stripped.
+message ConditionName {
+  // The condition name as the copybook declared it.
+  string name = 1;
+
+  // Values of the parent field the condition is true for, in declaration
+  // order.
+  repeated string values = 2;
+}
+
 // FieldSchema is one field of a record schema as the server resolved it,
 // including the byte offset it computed.
 message FieldSchema {
@@ -261,6 +275,28 @@ message FieldSchema {
   // Original COBOL picture clause when the layout carried one, otherwise
   // empty.
   string picture = 6;
+
+  // COBOL level number of the item this field was compiled from (05, 10, 77,
+  // and so on). Set only for copybook layouts; the protobuf and JSON forms
+  // describe a flat field list that has no levels.
+  optional uint32 level = 7;
+
+  // Dotted qualification path through the group items that contain this
+  // field, record name first, for example `CUSTOMER-RECORD.ADDRESS.STREET`.
+  // The flat forms have no groups, so their path is the field name.
+  string path = 8;
+
+  // One-based occurrence index when this field is one expansion of an OCCURS
+  // clause. `name` and `path` carry the COBOL subscript that goes with it,
+  // and `occurs_group` carries the unsubscripted name.
+  optional uint32 occurs_index = 9;
+
+  // Unsubscripted name of the repeating item this field is one occurrence of.
+  optional string occurs_group = 10;
+
+  // Level-88 condition names declared under this field, in declaration order.
+  // The closest thing a copybook has to an enumeration constraint.
+  repeated ConditionName conditions = 11;
 }
 
 // RecordSchema is one record layout as the server resolved it.
@@ -345,6 +381,12 @@ message RecordRow {
 
   // Decoded cells in field order, `FIELD_TYPE_SKIP` fillers omitted.
   repeated Cell cells = 5;
+
+  // Bytes this record occupies in the input, its prefix included, so
+  // `byte_offset` and `byte_length` together are the record's extent. Equal to
+  // the schema's `record_length` plus the prefix for fixed-length records, and
+  // the decoded length prefix for variable-length ones.
+  uint64 byte_length = 6;
 }
 
 // WarningCode names a recoverable anomaly the parse survived.

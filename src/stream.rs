@@ -191,6 +191,10 @@ impl RecordStream {
             row_index,
             record_index: self.records_kept,
             byte_offset,
+            // The walk knows exactly how many bytes this record cost, prefix
+            // included, and it is the only place that does: for a
+            // length-prefixed record the schema alone cannot say.
+            byte_length: total as u64,
             cells,
         };
         self.consume(total);
@@ -493,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_carry_their_own_index_and_offset() {
+    fn rows_carry_their_own_index_and_byte_extent() {
         let mut stream = RecordStream::new(simple_layout(), options());
         for (index, code) in ["AA", "BB", "CC"].iter().enumerate() {
             stream.push(&record(code, "01"));
@@ -502,6 +506,9 @@ mod tests {
             assert_eq!(rows[0].record_index, index as u64);
             assert_eq!(rows[0].row_index, index as u64);
             assert_eq!(rows[0].byte_offset, index as u64 * 4);
+            // Offset plus length is the record's extent in the input, which is
+            // the only location an EBCDIC record has.
+            assert_eq!(rows[0].byte_length, 4);
         }
     }
 
@@ -764,6 +771,12 @@ mod tests {
         assert_eq!(
             rows.iter().map(|r| r.byte_offset).collect::<Vec<_>>(),
             vec![0, 6, 15]
+        );
+        // The declared length is the extent, slack bytes included: the schema
+        // alone cannot say how wide a length-prefixed record was.
+        assert_eq!(
+            rows.iter().map(|r| r.byte_length).collect::<Vec<_>>(),
+            vec![6, 9, 6]
         );
     }
 

@@ -18,14 +18,18 @@
 //!
 //! ## Supported subset
 //!
-//! - Level numbers 01–49 and 77. Level 88 condition names are skipped (they
-//!   describe values, not storage); level 66 `RENAMES` is refused.
-//! - Group items, nested to any depth, flattened to their leaf fields.
+//! - Level numbers 01–49 and 77, kept on the field they came from. Level 88
+//!   condition names describe values rather than storage, so they become the
+//!   condition list of the item they follow; level 66 `RENAMES` is refused.
+//! - Group items, nested to any depth, flattened to their leaf fields, each
+//!   field keeping the dotted path of the groups it sits under.
 //! - `PIC X`/`A` character items, `PIC 9` numeric items with optional leading
 //!   `S` and a single `V` implied point.
 //! - `USAGE DISPLAY` (the default), `COMP-3`/`COMPUTATIONAL-3`/
 //!   `PACKED-DECIMAL`, and `COMP`/`COMP-4`/`COMPUTATIONAL`/`BINARY`.
-//! - `OCCURS n [TIMES]` on an elementary item, expanded to `NAME(1)` … `NAME(n)`.
+//! - `OCCURS n [TIMES]` on an elementary item, expanded to `NAME(1)` …
+//!   `NAME(n)`, each expansion keeping its one-based index and the name of the
+//!   item it repeats rather than only the subscript baked into a string.
 //! - `FILLER`, and anonymous items, which become `FIELD_TYPE_SKIP`.
 //! - Clauses that do not change the bytes (`VALUE`, `JUSTIFIED`, `BLANK WHEN
 //!   ZERO`, `GLOBAL`, `EXTERNAL`) are accepted and ignored.
@@ -36,7 +40,7 @@
 //! all is `INVALID_ARGUMENT`.
 
 use crate::error::ParseError;
-use crate::layout::{FieldKind, RawField, RawLayout, RawRecord};
+use crate::layout::{ConditionName, Declaration, FieldKind, RawField, RawLayout, RawRecord};
 
 /// Largest `OCCURS` count the compiler will expand.
 ///
@@ -60,10 +64,23 @@ pub(crate) fn compile(source: &str) -> Result<RawLayout, ParseError> {
         ));
     }
 
-    let mut items = Vec::new();
+    let mut items: Vec<Item> = Vec::new();
     for statement in statements {
-        if let Some(item) = parse_item(&statement)? {
-            items.push(item);
+        match parse_item(&statement)? {
+            Parsed::Item(item) => items.push(item),
+            // A level-88 entry declares no storage of its own: it names values
+            // of the item it follows, which is the item it is attached to
+            // here. One under a group item stays on the group, and the group
+            // is not a column, so it goes no further than this.
+            Parsed::Condition(condition) => {
+                let Some(item) = items.last_mut() else {
+                    return Err(ParseError::invalid(format!(
+                        "condition name {:?} comes before any data item to qualify",
+                        condition.name
+                    )));
+                };
+                item.conditions.push(condition);
+            }
         }
     }
     if items.is_empty() {
@@ -230,6 +247,16 @@ struct Item {
     usage: Usage,
     /// `OCCURS` count, absent when the item is not a table.
     occurs: Option<u32>,
+    /// Level-88 condition names declared under this item, in source order.
+    conditions: Vec<ConditionName>,
+}
+
+/// What one data-description statement turned out to be.
+enum Parsed {
+    /// An item that describes storage.
+    Item(Item),
+    /// A level-88 condition name, which qualifies the item before it.
+    Condition(ConditionName),
 }
 
 /// The storage usages the compiler recognizes.
@@ -312,13 +339,13 @@ fn ignorable(token: &str) -> bool {
     )
 }
 
-/// Parse one statement into an item, or `None` when it declares no storage.
+/// Parse one statement into an item, a condition name, or nothing.
 ///
 /// One long match rather than a clause table: every arm either sets a field or
 /// refuses, and splitting it would scatter the refusals away from the clauses
 /// they refuse.
 #[allow(clippy::too_many_lines)]
-fn parse_item(statement: &Statement) -> Result<Option<Item>, ParseError> {
+fn parse_item(statement: &Statement) -> Result<Parsed, ParseError> {
     let tokens: Vec<String> = statement.iter().map(|token| token.to_uppercase()).collect();
     let level: u8 = tokens[0].parse().map_err(|_| {
         ParseError::invalid(format!(
@@ -328,7 +355,7 @@ fn parse_item(statement: &Statement) -> Result<Option<Item>, ParseError> {
         ))
     })?;
     match level {
-        88 => return Ok(None),
+        88 => return condition_name(statement, &tokens).map(Parsed::Condition),
         66 => {
             return Err(ParseError::unsupported(
                 "level-66 RENAMES regroups fields that are already described",
@@ -442,13 +469,88 @@ fn parse_item(statement: &Statement) -> Result<Option<Item>, ParseError> {
         }
     }
 
-    Ok(Some(Item {
+    Ok(Parsed::Item(Item {
         level,
         name,
         picture,
         usage: usage.unwrap_or(Usage::Display),
         occurs,
+        conditions: Vec::new(),
     }))
+}
+
+/// Parse one level-88 entry into the condition name it declares.
+///
+/// The values are the literals of its `VALUE` clause with the quotes taken
+/// off, in declaration order, and a `THRU` range is kept as one value written
+/// `low THRU high` so that nothing about the declaration is invented or lost.
+fn condition_name(statement: &Statement, tokens: &[String]) -> Result<ConditionName, ParseError> {
+    let Some(name) = statement.get(1) else {
+        return Err(ParseError::invalid(
+            "a level-88 entry declares no condition name",
+        ));
+    };
+    if is_clause_keyword(&tokens[1]) {
+        return Err(ParseError::invalid(format!(
+            "the level-88 entry {:?} starts with a clause where its name should be",
+            statement.join(" ")
+        )));
+    }
+    let Some(start) = tokens
+        .iter()
+        .position(|token| token == "VALUE" || token == "VALUES")
+    else {
+        return Err(ParseError::invalid(format!(
+            "condition name {name:?} has no VALUE clause, so it names no values"
+        )));
+    };
+
+    let mut values: Vec<String> = Vec::new();
+    let mut range = false;
+    for (index, token) in tokens.iter().enumerate().skip(start + 1) {
+        match token.as_str() {
+            "IS" | "ARE" => {}
+            "THRU" | "THROUGH" => {
+                if values.is_empty() {
+                    return Err(ParseError::invalid(format!(
+                        "condition name {name:?} starts a THRU range with no value before it"
+                    )));
+                }
+                range = true;
+            }
+            _ => {
+                let literal = unquote(&statement[index]);
+                if range {
+                    let low = values.pop().unwrap_or_default();
+                    values.push(format!("{low} THRU {literal}"));
+                    range = false;
+                } else {
+                    values.push(literal);
+                }
+            }
+        }
+    }
+    if range || values.is_empty() {
+        return Err(ParseError::invalid(format!(
+            "the VALUE clause of condition name {name:?} is incomplete"
+        )));
+    }
+    Ok(ConditionName {
+        name: name.clone(),
+        values,
+    })
+}
+
+/// Strip the quotes from a COBOL literal, leaving anything else alone.
+fn unquote(literal: &str) -> String {
+    let bytes = literal.as_bytes();
+    let quoted =
+        bytes.len() >= 2 && matches!(bytes[0], b'\'' | b'"') && bytes[bytes.len() - 1] == bytes[0];
+    if quoted {
+        literal[1..literal.len() - 1].to_string()
+    } else {
+        literal.to_string()
+    }
 }
 
 /// Whether a token in the name position is really the start of a clause.
@@ -460,8 +562,16 @@ fn is_clause_keyword(token: &str) -> bool {
 }
 
 /// Walk the level tree and emit the elementary fields in physical order.
+///
+/// The tree is flattened because the record is flat, but nothing about it is
+/// thrown away: every field keeps its level number and the dotted path of the
+/// group items it sits under, which is how a mainframe consumer names it.
 fn flatten(items: &[Item], out: &mut Vec<RawField>) -> Result<(), ParseError> {
+    // The group items currently open, innermost last, as (level, name).
+    let mut groups: Vec<(u8, String)> = Vec::new();
     for (index, item) in items.iter().enumerate() {
+        groups.retain(|(level, _)| *level < item.level);
+        let label = item.name.clone().unwrap_or_else(|| "FILLER".to_string());
         let is_group = items
             .get(index + 1)
             .is_some_and(|next| next.level > item.level && item.level != 77);
@@ -480,7 +590,8 @@ fn flatten(items: &[Item], out: &mut Vec<RawField>) -> Result<(), ParseError> {
                 )));
             }
             // Children are emitted by their own iteration; a group contributes
-            // no bytes of its own.
+            // no bytes of its own, only a segment of their path.
+            groups.push((item.level, label));
             continue;
         }
         let Some(picture) = item.picture.as_deref() else {
@@ -490,39 +601,52 @@ fn flatten(items: &[Item], out: &mut Vec<RawField>) -> Result<(), ParseError> {
             )));
         };
         let described = describe(picture, item.usage, item.name.as_deref())?;
-        match item.occurs {
-            None => out.push(RawField {
-                name: item.name.clone().unwrap_or_default(),
+        let kind = if item.name.is_none() {
+            FieldKind::Skip
+        } else {
+            described.kind
+        };
+        // A filler has no name to qualify and cannot be referred to, so it has
+        // no path either; its width is still declared, and the gap it leaves
+        // between the offsets of its neighbours is how a consumer sees it.
+        let qualify = |leaf: &str| {
+            if item.name.is_none() {
+                return String::new();
+            }
+            let mut path = String::new();
+            for (_, group) in &groups {
+                path.push_str(group);
+                path.push('.');
+            }
+            path.push_str(leaf);
+            path
+        };
+        // One occurrence per expansion, each with the COBOL subscript that
+        // names it and the unsubscripted name of the item it repeats: the
+        // index is a number again rather than something to parse back out of
+        // a column name.
+        let occurrences = item.occurs.unwrap_or(1);
+        for occurrence in 1..=occurrences {
+            let leaf = match item.name.as_ref() {
+                None => String::new(),
+                Some(name) if item.occurs.is_some() => format!("{name}({occurrence})"),
+                Some(name) => name.clone(),
+            };
+            out.push(RawField {
                 size: described.size,
-                kind: if item.name.is_none() {
-                    FieldKind::Skip
-                } else {
-                    described.kind
-                },
+                kind,
                 scale: described.scale,
                 picture: picture.to_string(),
                 offset: None,
-            }),
-            Some(count) => {
-                for occurrence in 1..=count {
-                    out.push(RawField {
-                        name: item
-                            .name
-                            .as_ref()
-                            .map(|name| format!("{name}({occurrence})"))
-                            .unwrap_or_default(),
-                        size: described.size,
-                        kind: if item.name.is_none() {
-                            FieldKind::Skip
-                        } else {
-                            described.kind
-                        },
-                        scale: described.scale,
-                        picture: picture.to_string(),
-                        offset: None,
-                    });
-                }
-            }
+                declaration: Declaration {
+                    level: Some(u32::from(item.level)),
+                    path: qualify(&leaf),
+                    occurs_index: item.occurs.map(|_| occurrence),
+                    occurs_group: item.occurs.and(item.name.clone()),
+                    conditions: item.conditions.clone(),
+                },
+                name: leaf,
+            });
         }
     }
     Ok(())
@@ -824,6 +948,83 @@ mod tests {
     }
 
     #[test]
+    fn an_occurrence_keeps_its_index_and_the_name_it_repeats() {
+        // The subscript in the column name is a rendering; the index is a
+        // number and the group is a name, and both survive the flattening.
+        let record = &compile("01 REC.\n05 TOTALS.\n10 MONTH PIC S9(3) COMP-3 OCCURS 2.\n")
+            .unwrap()
+            .records[0];
+        assert_eq!(
+            record
+                .fields
+                .iter()
+                .map(|f| (
+                    f.declaration.path.as_str(),
+                    f.declaration.occurs_group.as_deref(),
+                    f.declaration.occurs_index,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("REC.TOTALS.MONTH(1)", Some("MONTH"), Some(1)),
+                ("REC.TOTALS.MONTH(2)", Some("MONTH"), Some(2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_field_that_does_not_repeat_says_so_by_omission() {
+        let record = &compile("01 REC.\n05 CODE PIC X(2).\n").unwrap().records[0];
+        assert_eq!(record.fields[0].declaration.occurs_index, None);
+        assert_eq!(record.fields[0].declaration.occurs_group, None);
+        assert_eq!(record.fields[0].declaration.level, Some(5));
+    }
+
+    #[test]
+    fn every_field_carries_its_level_and_its_qualification_path() {
+        let source = "01 CUSTOMER-RECORD.\n\
+                      05 ADDRESS.\n\
+                      10 STREET PIC X(20).\n\
+                      10 CITY PIC X(10).\n\
+                      05 ZIP PIC 9(5).\n\
+                      05 FILLER PIC X(3).\n";
+        let record = &compile(source).unwrap().records[0];
+        assert_eq!(
+            record
+                .fields
+                .iter()
+                .map(|f| (f.declaration.level, f.declaration.path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(10), "CUSTOMER-RECORD.ADDRESS.STREET"),
+                (Some(10), "CUSTOMER-RECORD.ADDRESS.CITY"),
+                (Some(5), "CUSTOMER-RECORD.ZIP"),
+                // A filler cannot be referred to, so it is given no path to
+                // refer to it by; its width is declared all the same.
+                (Some(5), ""),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_group_closes_when_a_level_at_or_above_it_arrives() {
+        let source = "01 REC.\n\
+                      05 A.\n\
+                      10 B.\n\
+                      15 C PIC X.\n\
+                      10 D PIC X.\n\
+                      05 E PIC X.\n";
+        let record = &compile(source).unwrap().records[0];
+        assert_eq!(
+            record
+                .fields
+                .iter()
+                .map(|f| f.declaration.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["REC.A.B.C", "REC.A.D", "REC.E"]
+        );
+    }
+
+    #[test]
     fn binary_widths_follow_the_digit_count() {
         let record = &compile(
             "01 REC.\n\
@@ -886,6 +1087,58 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["STATUS-CODE", "REST"]
         );
+    }
+
+    #[test]
+    fn condition_names_qualify_the_field_they_follow() {
+        let record = &compile(
+            "01 REC.\n\
+             05 STATUS-CODE PIC X.\n\
+             88 STATUS-OPEN VALUE 'O'.\n\
+             88 STATUS-CLOSED VALUES ARE 'C' 'X'.\n\
+             05 GRADE PIC 9.\n\
+             88 PASSING VALUE 1 THRU 3.\n\
+             05 REST PIC X(4).\n",
+        )
+        .unwrap()
+        .records[0];
+        let conditions: Vec<_> = record
+            .fields
+            .iter()
+            .map(|f| {
+                f.declaration
+                    .conditions
+                    .iter()
+                    .map(|c| (c.name.as_str(), c.values.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            conditions,
+            vec![
+                vec![
+                    ("STATUS-OPEN", vec!["O".to_string()]),
+                    ("STATUS-CLOSED", vec!["C".to_string(), "X".to_string()]),
+                ],
+                vec![("PASSING", vec!["1 THRU 3".to_string()])],
+                vec![],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_condition_name_needs_a_field_and_a_value_clause() {
+        for source in [
+            "88 ORPHAN VALUE 'O'.\n",
+            "01 REC.\n05 A PIC X.\n88 NOVALUE.\n",
+            "01 REC.\n05 A PIC X.\n88 OPEN VALUE 'A' THRU.\n",
+        ] {
+            let err = compile(source).unwrap_err();
+            assert!(
+                matches!(err, ParseError::Invalid(_)),
+                "{source:?} should be INVALID_ARGUMENT, got {err:?}"
+            );
+        }
     }
 
     #[test]
