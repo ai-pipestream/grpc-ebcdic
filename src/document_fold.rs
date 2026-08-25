@@ -547,6 +547,9 @@ fn table_cell(text: String, row: u64, column: usize, column_header: bool) -> doc
         row_section: false,
         fillable: false,
         r#ref: None,
+        // Filled in by the typed-cell wiring; a header cell never has either.
+        value: None,
+        spans: Vec::new(),
     }
 }
 
