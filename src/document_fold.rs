@@ -1368,7 +1368,7 @@ mod tests {
             declared
                 .iter()
                 .map(|column| (
-                    column.name.as_str(),
+                    column.name.as_deref().unwrap_or(""),
                     column.declared_type.as_deref(),
                     column.byte_offset,
                     column.byte_size,
@@ -1390,7 +1390,7 @@ mod tests {
         assert_eq!(
             declared
                 .iter()
-                .map(|column| column.name.clone())
+                .map(|column| column.name.clone().unwrap_or_default())
                 .collect::<Vec<_>>(),
             row_text(table, 0)
         );
@@ -1415,7 +1415,11 @@ mod tests {
         assert_eq!(
             columns(table)
                 .iter()
-                .map(|column| (column.name.as_str(), column.byte_offset, column.byte_size))
+                .map(|column| (
+                    column.name.as_deref().unwrap_or(""),
+                    column.byte_offset,
+                    column.byte_size
+                ))
                 .collect::<Vec<_>>(),
             vec![("REC.A", Some(0), Some(2)), ("REC.B", Some(5), Some(2)),]
         );
@@ -1445,7 +1449,7 @@ mod tests {
             columns(table)
                 .iter()
                 .map(|column| (
-                    column.name.as_str(),
+                    column.name.as_deref().unwrap_or(""),
                     column.level,
                     column.picture.as_deref(),
                     column.declared_type.as_deref(),
@@ -1926,7 +1930,7 @@ mod tests {
         assert_eq!(
             declared
                 .iter()
-                .map(|column| (column.name.as_str(), column.occurs_index))
+                .map(|column| (column.name.as_deref().unwrap_or(""), column.occurs_index))
                 .collect::<Vec<_>>(),
             vec![
                 // A field that occurs once is not occurrence one.

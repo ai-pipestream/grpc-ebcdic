@@ -1302,7 +1302,7 @@ async fn a_folded_document_declares_the_columns_the_copybook_declared() {
             .columns
             .iter()
             .map(|column| (
-                column.name.as_str(),
+                column.name.as_deref().unwrap_or(""),
                 column.declared_type.as_deref(),
                 column.picture.as_deref(),
                 column.byte_offset,
@@ -1518,7 +1518,7 @@ async fn the_layout_event_carries_condition_names_and_occurrences() {
     assert_eq!(
         columns
             .iter()
-            .map(|column| (column.name.as_str(), column.occurs_index))
+            .map(|column| (column.name.as_deref().unwrap_or(""), column.occurs_index))
             .collect::<Vec<_>>(),
         vec![
             ("REC.STATUS-CODE", None),
