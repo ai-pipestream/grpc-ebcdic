@@ -594,6 +594,7 @@ impl DocumentFold {
                 confidence: None,
                 raw_score: None,
                 raw_score_kind: None,
+                raw_score_samples: None,
             })),
         }
     }
@@ -668,7 +669,7 @@ fn column(field: &pb::FieldSchema) -> Column {
     Column {
         name: field.name.clone(),
         schema: doc::TableColumnSchema {
-            name: path,
+            name: Some(path),
             declared_type: field_type_name(field.r#type).map(str::to_string),
             picture: if field.picture.is_empty() {
                 None
@@ -690,6 +691,7 @@ fn column(field: &pb::FieldSchema) -> Column {
             // which is `byte_size`, and no width on any page.
             width: None,
             conditions: field.conditions.iter().map(condition).collect(),
+            ..Default::default()
         },
     }
 }
@@ -806,6 +808,9 @@ fn table_cell(
         // No spans: a decoded field is one run of plain text, with no
         // emphasis and no links to mark up.
         spans: Vec::new(),
+        // No declared alignment: a fixed-record field states none.
+        align: None,
+        valign: None,
     }
 }
 
