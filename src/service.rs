@@ -169,14 +169,16 @@ impl EbcdicParseService for EbcdicGrpc {
             // Held for the life of the parse so the permit is released exactly
             // when the stream ends, however it ends.
             let _permit = permit;
-            let outcome = run_parse(
+            // Boxed: the parse future carries the layout and fold state across
+            // every await, so it is far too large to keep on the task's stack.
+            let outcome = Box::pin(run_parse(
                 &mut inbound,
                 RecordStream::new(layout, decode_options),
                 layout_info,
                 byte_cap,
                 EventSink { tx: &tx, fold },
                 &metrics,
-            )
+            ))
             .await;
             match outcome {
                 Ok(()) => Metrics::bump(&metrics.parses_completed),
@@ -326,7 +328,9 @@ async fn run_parse(
     walk.finish_input();
     drain(&mut walk, &mut sink, metrics).await?;
     let status = walk.status()?;
-    sink.finish(status).await
+    // Boxed: the trailer future holds the status and document messages across
+    // two sends, which makes it too large to inline into this frame.
+    Box::pin(sink.finish(status)).await
 }
 
 /// Emit every record the walk can produce right now.
