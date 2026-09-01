@@ -20,7 +20,7 @@ FROM rust:1.98-slim-trixie AS build
 # drives tonic-prost-build, which shells out to it.
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends protobuf-compiler; \
+    apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev; \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
