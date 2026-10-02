@@ -921,13 +921,13 @@ async fn get_service_info_reports_what_this_build_can_do() {
         info.supported_field_types
             .contains(&(pb::FieldType::PackedDecimal as i32))
     );
-    assert!(!info.version.is_empty());
+    assert!(!info.version.is_empty(), "is empty");
     let ui = info
         .ui
         .expect("the demo shell reads ui to build its tab bar");
     assert_eq!(ui.title, "EBCDIC");
     assert_eq!(ui.path, "/ui/ebcdic");
-    assert!(!ui.description.is_empty());
+    assert!(!ui.description.is_empty(), "is empty");
 }
 
 #[tokio::test]
@@ -988,7 +988,7 @@ async fn an_empty_input_produces_a_layout_and_an_empty_trailer() {
     let parsed = parse(&client, customer_options(), b"")
         .await
         .expect("no records is not an error");
-    assert!(parsed.rows.is_empty());
+    assert!(parsed.rows.is_empty(), "{:?}", parsed.rows);
     assert_eq!(parsed.status.records_kept, 0);
     assert_eq!(parsed.status.bytes_received, 0);
     assert!(
@@ -1113,8 +1113,8 @@ async fn the_document_event_arrives_once_immediately_before_the_trailer() {
     assert_eq!(document.name, "CUSTOMER-RECORD");
     // The flat docling shape: no groups, and with one schema and no layout
     // description the table is the whole body.
-    assert!(document.groups.is_empty());
-    assert!(document.texts.is_empty());
+    assert!(document.groups.is_empty(), "{:?}", document.groups);
+    assert!(document.texts.is_empty(), "{:?}", document.texts);
     assert_eq!(document.tables.len(), 1);
     assert_eq!(
         document
@@ -1544,5 +1544,5 @@ async fn the_layout_event_carries_condition_names_and_occurrences() {
             ("STATUS-SHUT", vec![("C", None), ("X", None)]),
         ]
     );
-    assert!(columns[1].conditions.is_empty());
+    assert_eq!(columns[1].conditions.len(), 0);
 }

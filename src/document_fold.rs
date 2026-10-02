@@ -1255,7 +1255,7 @@ mod tests {
         // The layout's description names the document and opens it.
         assert_eq!(document.name, "ACCOUNTS EXTRACT");
         assert!(document.origin.is_none(), "the stream carries no filename");
-        assert!(document.pictures.is_empty());
+        assert!(document.pictures.is_empty(), "{:?}", document.pictures);
         assert!(
             document.field_regions.is_empty() && document.field_items.is_empty(),
             "the coordinator's merge drops these silently"
@@ -1649,7 +1649,7 @@ mod tests {
         // Upstream emits a heading only when there is more than one schema,
         // and there is nothing else to write here: no description, no groups.
         assert!(document.texts.is_empty(), "{:?}", document.texts);
-        assert!(document.groups.is_empty());
+        assert!(document.groups.is_empty(), "{:?}", document.groups);
         assert_eq!(document.tables.len(), 1);
         assert_eq!(
             document
@@ -1910,7 +1910,7 @@ mod tests {
 
         // A field with no level-88 under it declares no conditions, which is
         // not the same as declaring an empty one.
-        assert!(declared[3].conditions.is_empty());
+        assert_eq!(declared[3].conditions.len(), 0);
     }
 
     #[test]
@@ -1967,7 +1967,7 @@ mod tests {
         }
         let warnings = fold.truncation_warnings();
         let document = fold.take();
-        assert!(integrity_errors(&document).is_empty());
+        assert_eq!(integrity_errors(&document), Vec::<String>::new());
 
         assert_eq!(
             warnings.len(),
