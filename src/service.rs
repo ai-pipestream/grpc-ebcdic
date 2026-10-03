@@ -14,6 +14,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -44,6 +45,14 @@ pub const DEFAULT_MAX_DOCUMENT_MIB: u32 = 512;
 /// a live view than one that fails fast.
 pub const DEFAULT_MAX_CONCURRENT_PARSES: usize = 64;
 
+/// Default longest wait for the next inbound frame, in seconds.
+///
+/// A parse slot is held from admission to the trailer, so a client that opens
+/// a stream and then sends nothing would otherwise hold one until a keepalive
+/// or its own deadline fires, and sixty-four such clients refuse everyone
+/// else. Half a minute between frames is far slower than any real upload.
+pub const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 30;
+
 /// Events buffered between the decoder and the wire.
 ///
 /// Small on purpose. A deep queue would let the decoder run ahead of a slow
@@ -53,8 +62,11 @@ const EVENT_CHANNEL_CAPACITY: usize = 32;
 
 /// The service implementation.
 pub struct EbcdicGrpc {
-    /// Byte cap applied when the request does not set one.
+    /// Byte cap applied when the request does not set one, and the most a
+    /// request may ask for.
     max_document_bytes: u64,
+    /// Longest wait for the next inbound frame before the parse is ended.
+    idle_timeout: Duration,
     /// Admission control for concurrent parses.
     permits: Arc<Semaphore>,
     /// How many permits the semaphore was built with, for `GetServiceInfo`.
@@ -69,6 +81,7 @@ impl EbcdicGrpc {
     pub fn new(metrics: Arc<Metrics>) -> Self {
         Self {
             max_document_bytes: u64::from(DEFAULT_MAX_DOCUMENT_MIB) << 20,
+            idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECONDS),
             permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_PARSES)),
             max_concurrent_parses: DEFAULT_MAX_CONCURRENT_PARSES,
             metrics,
@@ -79,6 +92,14 @@ impl EbcdicGrpc {
     #[must_use]
     pub fn with_max_document_mib(mut self, mib: u32) -> Self {
         self.max_document_bytes = u64::from(mib.max(1)) << 20;
+        self
+    }
+
+    /// Override how long the server waits for the next inbound frame. Zero
+    /// is raised to one millisecond: an idle stream is always bounded.
+    #[must_use]
+    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = timeout.max(Duration::from_millis(1));
         self
     }
 
@@ -97,11 +118,14 @@ impl EbcdicGrpc {
     }
 
     /// Resolve the byte cap for one request.
+    ///
+    /// A request may lower the operator's cap but never raise it: the cap is
+    /// the operator's bound on one caller, not the caller's to lift.
     fn byte_cap(&self, options: &pb::ParseOptions) -> u64 {
         if options.max_document_mib == 0 {
             self.max_document_bytes
         } else {
-            u64::from(options.max_document_mib) << 20
+            (u64::from(options.max_document_mib) << 20).min(self.max_document_bytes)
         }
     }
 }
@@ -132,9 +156,17 @@ impl EbcdicParseService for EbcdicGrpc {
 
         // The options frame is read before the response stream opens, so a bad
         // layout is a plain unary error with no half-open stream behind it.
-        let first = inbound.message().await?.ok_or_else(|| {
-            Status::invalid_argument("the request stream ended before its options frame")
-        })?;
+        let idle_timeout = self.idle_timeout;
+        let first = next_frame(&mut inbound, idle_timeout)
+            .await
+            .map_err(|error| match error {
+                // The client's own stream error, passed through as it was.
+                NextFrame::Stream(status) => status,
+                NextFrame::Idle(error) => Status::from(error),
+            })?
+            .ok_or_else(|| {
+                Status::invalid_argument("the request stream ended before its options frame")
+            })?;
         let options = match first.frame {
             Some(pb::parse_ebcdic_request::Frame::Options(options)) => options,
             Some(pb::parse_ebcdic_request::Frame::Chunk(_)) => {
@@ -176,7 +208,10 @@ impl EbcdicParseService for EbcdicGrpc {
                 &mut inbound,
                 RecordStream::new(layout, decode_options),
                 layout_info,
-                byte_cap,
+                Limits {
+                    byte_cap,
+                    idle_timeout,
+                },
                 EventSink { tx: &tx, fold },
                 &metrics,
             ))
@@ -280,6 +315,36 @@ impl EventSink<'_> {
     }
 }
 
+/// The per-stream bounds `run_parse` enforces.
+struct Limits {
+    /// Most bytes the stream may send.
+    byte_cap: u64,
+    /// Longest wait for the next inbound frame.
+    idle_timeout: Duration,
+}
+
+/// Why no frame was read.
+enum NextFrame {
+    /// The request stream itself failed.
+    Stream(Status),
+    /// Nothing arrived within the idle timeout.
+    Idle(ParseError),
+}
+
+/// Read the next inbound frame, giving up after `idle_timeout`.
+async fn next_frame(
+    inbound: &mut Streaming<pb::ParseEbcdicRequest>,
+    idle_timeout: Duration,
+) -> Result<Option<pb::ParseEbcdicRequest>, NextFrame> {
+    match tokio::time::timeout(idle_timeout, inbound.message()).await {
+        Ok(result) => result.map_err(NextFrame::Stream),
+        Err(_) => Err(NextFrame::Idle(ParseError::timed_out(format!(
+            "no request frame arrived for {} ms; an idle stream may not hold a parse slot",
+            idle_timeout.as_millis()
+        )))),
+    }
+}
+
 /// Drive one parse from the first data frame to the trailer.
 ///
 /// Every row is awaited onto the channel before the next is decoded, so a
@@ -289,7 +354,7 @@ async fn run_parse(
     inbound: &mut Streaming<pb::ParseEbcdicRequest>,
     mut walk: RecordStream,
     layout_info: pb::LayoutInfo,
-    byte_cap: u64,
+    limits: Limits,
     mut sink: EventSink<'_>,
     metrics: &Metrics,
 ) -> Result<(), ParseError> {
@@ -297,15 +362,16 @@ async fn run_parse(
         .await?;
 
     loop {
-        let frame = match inbound.message().await {
+        let frame = match next_frame(inbound, limits.idle_timeout).await {
             Ok(Some(frame)) => frame,
             Ok(None) => break,
             // The client hung up or cancelled. Nothing to report to it.
-            Err(status) => {
+            Err(NextFrame::Stream(status)) => {
                 return Err(ParseError::internal(format!(
                     "request stream failed: {status}"
                 )));
             }
+            Err(NextFrame::Idle(error)) => return Err(error),
         };
         let chunk = match frame.frame {
             Some(pb::parse_ebcdic_request::Frame::Chunk(chunk)) => chunk,
@@ -316,9 +382,10 @@ async fn run_parse(
             }
             None => continue,
         };
-        if walk.received() + chunk.len() as u64 > byte_cap {
+        if walk.received() + chunk.len() as u64 > limits.byte_cap {
             return Err(ParseError::exhausted(format!(
-                "the input exceeds the {byte_cap}-byte cap for this stream"
+                "the input exceeds the {}-byte cap for this stream",
+                limits.byte_cap
             )));
         }
         Metrics::add(&metrics.bytes_received, chunk.len() as u64);

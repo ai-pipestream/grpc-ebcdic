@@ -129,7 +129,7 @@ Set on the first frame. Exactly one layout form is required.
 | `max_records` | `0` (all) | stop after this many records |
 | `strip_control_characters` | `true` | drop Unicode control characters from text |
 | `abort_on_error` | `false` | refuse a trailing partial record instead of warning |
-| `max_document_mib` | server default (512) | per-stream byte cap |
+| `max_document_mib` | server default (512) | per-stream byte cap; may lower the server's cap, never raise it |
 | `emit_document` | `false` | also fold the parse into one `Document` (see below) |
 
 The three layout forms are a protobuf `oneof`, so "both" cannot be expressed on
@@ -450,6 +450,7 @@ All optional; see `src/main.rs`.
 | `GRPC_EBCDIC_WORKERS` | CPU count | tokio worker threads |
 | `GRPC_EBCDIC_MAX_DOCUMENT_MIB` | `512` | byte cap when the request sets none |
 | `GRPC_EBCDIC_MAX_CONCURRENT_PARSES` | `64` | parses admitted at once; past it, refused not queued |
+| `GRPC_EBCDIC_IDLE_TIMEOUT_SECONDS` | `30` | longest wait for the next request frame; past it the parse ends with `DEADLINE_EXCEEDED` |
 | `GRPC_EBCDIC_METRICS_INTERVAL_SECONDS` | `60` | metrics line interval; `0` disables |
 | `GRPC_EBCDIC_WINDOW_BYTES` | 16 MiB | HTTP/2 initial stream and connection window |
 

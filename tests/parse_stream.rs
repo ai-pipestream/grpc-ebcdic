@@ -729,6 +729,77 @@ async fn the_byte_cap_is_resource_exhausted() {
 }
 
 #[tokio::test]
+async fn a_request_cannot_raise_the_servers_byte_cap() {
+    let client = start_server_with(EbcdicGrpc::new(Metrics::new()).with_max_document_mib(1)).await;
+    let mut data = Vec::new();
+    while data.len() <= 1024 * 1024 {
+        data.extend(customer(1, "BIG", 0, 0));
+    }
+    let options = pb::ParseOptions {
+        max_document_mib: 4_000_000,
+        ..customer_options()
+    };
+    let status = parse(&client, options, &data)
+        .await
+        .expect_err("the operator's cap still applies");
+    assert_eq!(status.code(), Code::ResourceExhausted);
+}
+
+#[tokio::test]
+async fn an_idle_stream_gives_its_parse_slot_back() {
+    let client = start_server_with(
+        EbcdicGrpc::new(Metrics::new())
+            .with_max_concurrent_parses(1)
+            .with_idle_timeout(Duration::from_millis(200)),
+    )
+    .await;
+
+    // Open a stream and never send its options frame.
+    let (silent_tx, silent_rx) = tokio::sync::mpsc::channel::<pb::ParseEbcdicRequest>(1);
+    let mut silent = client.clone();
+    let status = tokio::time::timeout(
+        Duration::from_secs(5),
+        silent.parse_ebcdic(tokio_stream::wrappers::ReceiverStream::new(silent_rx)),
+    )
+    .await
+    .expect("the server gives up on a silent stream")
+    .expect_err("a stream with no options frame is ended");
+    assert_eq!(status.code(), Code::DeadlineExceeded);
+
+    // Send the options and then go quiet mid-parse: the parse ends too.
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    tx.send(options_frame(customer_options())).await.unwrap();
+    let mut idle = client.clone();
+    let mut stream = idle
+        .parse_ebcdic(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await
+        .expect("admitted")
+        .into_inner();
+    next_event(&mut stream).await;
+    let status = tokio::time::timeout(Duration::from_secs(5), stream.message())
+        .await
+        .expect("the server gives up on an idle stream")
+        .expect_err("an idle parse is ended");
+    assert_eq!(status.code(), Code::DeadlineExceeded);
+
+    // Neither held the only slot: a real parse is admitted after them.
+    for attempt in 0.. {
+        match parse(&client, customer_options(), &customer(2, "THIRD", 0, 0)).await {
+            Ok(parsed) => {
+                assert_eq!(parsed.rows.len(), 1);
+                break;
+            }
+            Err(status) if attempt < 50 => {
+                assert_eq!(status.code(), Code::ResourceExhausted);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(status) => panic!("the idle streams kept the slot: {status}"),
+        }
+    }
+    drop((silent_tx, tx));
+}
+
+#[tokio::test]
 async fn an_unsupported_copybook_feature_is_unimplemented() {
     let client = start_server().await;
     let options = pb::ParseOptions {

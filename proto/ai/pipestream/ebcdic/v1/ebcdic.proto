@@ -177,7 +177,9 @@ message ParseOptions {
   bool abort_on_error = 7;
 
   // Upper bound on the input, in mebibytes. Zero means the server default.
-  // Exceeding it fails the stream with RESOURCE_EXHAUSTED.
+  // A value above the server default is clamped to it: a request may lower
+  // the operator's cap but not raise it. Exceeding it fails the stream with
+  // RESOURCE_EXHAUSTED.
   uint32 max_document_mib = 8;
 
   // Also fold the parse into a single `ai.pipestream.document.v1.Document`
