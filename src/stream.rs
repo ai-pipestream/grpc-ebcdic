@@ -562,15 +562,17 @@ mod tests {
         let started = std::time::Instant::now();
         stream.push(&chunk);
         let mut rows = 0u64;
+        // Checked inside the loop: a quadratic drain would otherwise hang
+        // the test for hours instead of failing it.
         while stream.next_record().expect("no decode failure").is_some() {
             rows += 1;
+            assert!(
+                started.elapsed() < std::time::Duration::from_mins(1),
+                "the drain is not linear: {rows} records after {:?}",
+                started.elapsed()
+            );
         }
-        let elapsed = started.elapsed();
         assert_eq!(rows, 1024 * 1024);
-        assert!(
-            elapsed < std::time::Duration::from_secs(60),
-            "a 4 MiB chunk of short records took {elapsed:?}"
-        );
         stream.finish_input();
         let status = stream.status().unwrap();
         assert_eq!(status.bytes_consumed, 4 * 1024 * 1024);
