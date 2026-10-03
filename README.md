@@ -450,7 +450,7 @@ All optional; see `src/main.rs`.
 | `GRPC_EBCDIC_WORKERS` | CPU count | tokio worker threads |
 | `GRPC_EBCDIC_MAX_DOCUMENT_MIB` | `512` | byte cap when the request sets none |
 | `GRPC_EBCDIC_MAX_CONCURRENT_PARSES` | `64` | parses admitted at once; past it, refused not queued |
-| `GRPC_EBCDIC_IDLE_TIMEOUT_SECONDS` | `30` | longest wait for the next request frame; past it the parse ends with `DEADLINE_EXCEEDED` |
+| `GRPC_EBCDIC_IDLE_TIMEOUT_SECONDS` | `30` | longest wait for the next request frame, or for the client to take the next event; past it the parse ends with `DEADLINE_EXCEEDED` and frees its slot |
 | `GRPC_EBCDIC_METRICS_INTERVAL_SECONDS` | `60` | metrics line interval; `0` disables |
 | `GRPC_EBCDIC_WINDOW_BYTES` | 16 MiB | HTTP/2 initial stream and connection window |
 

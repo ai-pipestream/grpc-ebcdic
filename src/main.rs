@@ -11,8 +11,8 @@
 //! - `GRPC_EBCDIC_MAX_CONCURRENT_PARSES` — parse streams admitted at once
 //!   (default 64). Past the cap a call is refused, not queued.
 //! - `GRPC_EBCDIC_IDLE_TIMEOUT_SECONDS` — longest wait for the next request
-//!   frame before the parse ends with `DEADLINE_EXCEEDED` (default 30,
-//!   minimum 1).
+//!   frame, or for the client to take the next event, before the parse ends
+//!   with `DEADLINE_EXCEEDED` (default 30, minimum 1).
 //! - `GRPC_EBCDIC_METRICS_INTERVAL_SECONDS` — seconds between metrics lines on
 //!   stdout (default 60; `0` disables them).
 //! - `GRPC_EBCDIC_WINDOW_BYTES` — HTTP/2 initial stream and connection window

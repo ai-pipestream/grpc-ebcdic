@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{Semaphore, mpsc};
+use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -45,12 +46,14 @@ pub const DEFAULT_MAX_DOCUMENT_MIB: u32 = 512;
 /// a live view than one that fails fast.
 pub const DEFAULT_MAX_CONCURRENT_PARSES: usize = 64;
 
-/// Default longest wait for the next inbound frame, in seconds.
+/// Default longest wait, in seconds, for the next inbound frame and for the
+/// client to take the next outbound event.
 ///
 /// A parse slot is held from admission to the trailer, so a client that opens
-/// a stream and then sends nothing would otherwise hold one until a keepalive
-/// or its own deadline fires, and sixty-four such clients refuse everyone
-/// else. Half a minute between frames is far slower than any real upload.
+/// a stream and then sends nothing, or uploads and then never reads, would
+/// otherwise hold one until a keepalive or its own deadline fires, and
+/// sixty-four such clients refuse everyone else. Half a minute between frames
+/// is far slower than any real upload or reader.
 pub const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 30;
 
 /// Events buffered between the decoder and the wire.
@@ -65,7 +68,8 @@ pub struct EbcdicGrpc {
     /// Byte cap applied when the request does not set one, and the most a
     /// request may ask for.
     max_document_bytes: u64,
-    /// Longest wait for the next inbound frame before the parse is ended.
+    /// Longest wait for the next inbound frame, or for the client to take the
+    /// next event, before the parse is ended.
     idle_timeout: Duration,
     /// Admission control for concurrent parses.
     permits: Arc<Semaphore>,
@@ -95,8 +99,9 @@ impl EbcdicGrpc {
         self
     }
 
-    /// Override how long the server waits for the next inbound frame. Zero
-    /// is raised to one millisecond: an idle stream is always bounded.
+    /// Override how long the server waits for the next inbound frame or for
+    /// the client to take the next event. Zero is raised to one millisecond:
+    /// an idle stream is always bounded.
     #[must_use]
     pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle_timeout = timeout.max(Duration::from_millis(1));
@@ -199,9 +204,10 @@ impl EbcdicParseService for EbcdicGrpc {
         let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
         tokio::spawn(async move {
-            // Held for the life of the parse so the permit is released exactly
-            // when the stream ends, however it ends.
-            let _permit = permit;
+            // Held until the parse is decided, so the slot is released when the
+            // parse ends, however it ends, and not when a stalled client
+            // finally reads the error.
+            let permit = permit;
             // Boxed: the parse future carries the layout and fold state across
             // every await, so it is far too large to keep on the task's stack.
             let outcome = Box::pin(run_parse(
@@ -212,10 +218,15 @@ impl EbcdicParseService for EbcdicGrpc {
                     byte_cap,
                     idle_timeout,
                 },
-                EventSink { tx: &tx, fold },
+                EventSink {
+                    tx: &tx,
+                    fold,
+                    idle_timeout,
+                },
                 &metrics,
             ))
             .await;
+            drop(permit);
             match outcome {
                 Ok(()) => Metrics::bump(&metrics.parses_completed),
                 Err(error) => {
@@ -223,16 +234,20 @@ impl EbcdicParseService for EbcdicGrpc {
                     if error.code() == tonic::Code::ResourceExhausted {
                         Metrics::bump(&metrics.byte_cap_hits);
                     }
-                    // A send failure here only means the client is gone, which
-                    // is not something the server can or should report.
-                    let _ = tx.send(Err(Status::from(error))).await;
+                    // Bounded like every other send. If the client is gone or
+                    // still not reading, the error is not delivered and the
+                    // stream ends without a trailer, which `TrailerGuard`
+                    // reports as an error rather than a bare OK.
+                    let _ =
+                        tokio::time::timeout(idle_timeout, tx.send(Err(Status::from(error)))).await;
                 }
             }
         });
 
-        Ok(Response::new(
-            Box::pin(ReceiverStream::new(rx)) as EventStream
-        ))
+        Ok(Response::new(Box::pin(TrailerGuard {
+            events: ReceiverStream::new(rx),
+            finished: false,
+        }) as EventStream))
     }
 
     async fn get_service_info(
@@ -280,19 +295,29 @@ struct EventSink<'a> {
     tx: &'a mpsc::Sender<Result<pb::ParseEbcdicResponse, Status>>,
     /// The Document fold, when `emit_document` was set.
     fold: Option<DocumentFold>,
+    /// Longest wait for the client to make room for the next event.
+    idle_timeout: Duration,
 }
 
 impl EventSink<'_> {
     /// Fold one event and send it, treating a closed channel as a cancelled
-    /// call.
+    /// call and a client that takes nothing for the idle timeout as a stalled
+    /// one, so neither holds the parse slot.
     async fn send(&mut self, event: pb::parse_ebcdic_response::Event) -> Result<(), ParseError> {
         if let Some(fold) = self.fold.as_mut() {
             fold.consume(&event);
         }
-        self.tx
-            .send(Ok(pb::ParseEbcdicResponse { event: Some(event) }))
-            .await
-            .map_err(|_| ParseError::internal("the client stopped reading the event stream"))
+        let sent = self
+            .tx
+            .send(Ok(pb::ParseEbcdicResponse { event: Some(event) }));
+        match tokio::time::timeout(self.idle_timeout, sent).await {
+            Ok(result) => result
+                .map_err(|_| ParseError::internal("the client stopped reading the event stream")),
+            Err(_) => Err(ParseError::timed_out(format!(
+                "the client took no event for {} ms; a stalled stream may not hold a parse slot",
+                self.idle_timeout.as_millis()
+            ))),
+        }
     }
 
     /// Send the trailer, preceded by the Document when one was asked for.
@@ -312,6 +337,52 @@ impl EventSink<'_> {
         self.send(pb::parse_ebcdic_response::Event::Document(fold.take()))
             .await?;
         self.send(status).await
+    }
+}
+
+/// The response stream: the parse's events, then an error if the parse ended
+/// without its trailer.
+///
+/// The trailer is the contract's last word. When it could not be delivered (an
+/// error the stalled client was not reading for), the channel simply closes,
+/// and passing that through would end the call OK with the rows cut short.
+struct TrailerGuard {
+    /// The events the parse task sent.
+    events: ReceiverStream<Result<pb::ParseEbcdicResponse, Status>>,
+    /// Set once a trailer or an error has gone out.
+    finished: bool,
+}
+
+impl Stream for TrailerGuard {
+    type Item = Result<pb::ParseEbcdicResponse, Status>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.finished {
+            return std::task::Poll::Ready(None);
+        }
+        let polled = Pin::new(&mut self.events).poll_next(cx);
+        match polled {
+            std::task::Poll::Ready(Some(item)) => {
+                self.finished = match &item {
+                    Err(_) => true,
+                    Ok(response) => matches!(
+                        response.event,
+                        Some(pb::parse_ebcdic_response::Event::Status(_))
+                    ),
+                };
+                std::task::Poll::Ready(Some(item))
+            }
+            std::task::Poll::Ready(None) => {
+                self.finished = true;
+                std::task::Poll::Ready(Some(Err(Status::internal(
+                    "the parse ended without a ParseStatus trailer",
+                ))))
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
     }
 }
 

@@ -800,6 +800,75 @@ async fn an_idle_stream_gives_its_parse_slot_back() {
 }
 
 #[tokio::test]
+async fn a_client_that_stops_reading_gives_its_parse_slot_back() {
+    let client = start_server_with(
+        EbcdicGrpc::new(Metrics::new())
+            .with_max_concurrent_parses(1)
+            .with_idle_timeout(Duration::from_secs(1)),
+    )
+    .await;
+    // A full second, not the idle test's 200 ms: the probe parses below run
+    // while the stalled one is decoding, and must not trip the bound themselves.
+
+    // Upload far more rows than the event queue and the HTTP/2 windows hold,
+    // read the first event, then stop reading with the stream still open.
+    let one = customer(1, "STALLED", 0, 0);
+    let data: Vec<u8> = one
+        .iter()
+        .copied()
+        .cycle()
+        .take(one.len() * 200_000)
+        .collect();
+    let mut frames = vec![options_frame(customer_options())];
+    frames.extend(data.chunks(64 * 1024).map(chunk_frame));
+    let mut stalled = client.clone();
+    let mut stream = stalled
+        .parse_ebcdic(tokio_stream::iter(frames))
+        .await
+        .expect("admitted")
+        .into_inner();
+    next_event(&mut stream).await;
+
+    // The stalled reader does not hold the only slot.
+    for attempt in 0.. {
+        match parse(&client, customer_options(), &customer(2, "NEXT", 0, 0)).await {
+            Ok(parsed) => {
+                assert_eq!(parsed.rows.len(), 1);
+                break;
+            }
+            Err(status) if attempt < 100 => {
+                assert_eq!(status.code(), Code::ResourceExhausted);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(status) => panic!("the stalled reader kept the slot: {status}"),
+        }
+    }
+
+    // When it reads again it drains what was queued and then learns the
+    // parse ended: never a clean end with the rows cut short.
+    let ending = loop {
+        match tokio::time::timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("the stream ends")
+        {
+            Ok(Some(event)) => assert!(
+                !matches!(
+                    event.event,
+                    Some(pb::parse_ebcdic_response::Event::Status(_))
+                ),
+                "a stalled parse has no trailer"
+            ),
+            Ok(None) => panic!("the stream ended OK without its trailer"),
+            Err(status) => break status,
+        }
+    };
+    assert!(
+        matches!(ending.code(), Code::DeadlineExceeded | Code::Internal),
+        "{ending}"
+    );
+}
+
+#[tokio::test]
 async fn an_unsupported_copybook_feature_is_unimplemented() {
     let client = start_server().await;
     let options = pb::ParseOptions {
