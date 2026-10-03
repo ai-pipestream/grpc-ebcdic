@@ -88,8 +88,8 @@ message ParseEbcdicResponse {
     // that want the gRParse Document plane rather than the typed rows: cells
     // become table text, so a `decimal` cell arrives as its exact canonical
     // rendering and a client that needs the scale or the sign nibble reads the
-    // `record` events instead. Bounded by a per-schema row cap; see
-    // WARNING_CODE_DOCUMENT_ROWS_TRUNCATED.
+    // `record` events instead. Bounded by a per-schema row cap and a
+    // Document-wide size budget; see WARNING_CODE_DOCUMENT_ROWS_TRUNCATED.
     ai.pipestream.document.v1.Document document = 4;
   }
 }

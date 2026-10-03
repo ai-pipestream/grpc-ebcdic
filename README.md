@@ -129,7 +129,7 @@ Set on the first frame. Exactly one layout form is required.
 | `max_records` | `0` (all) | stop after this many records |
 | `strip_control_characters` | `true` | drop Unicode control characters from text |
 | `abort_on_error` | `false` | refuse a trailing partial record instead of warning |
-| `max_document_mib` | server default (512) | per-stream byte cap |
+| `max_document_mib` | server default (512) | per-stream byte cap; may lower the server's cap, never raise it |
 | `emit_document` | `false` | also fold the parse into one `Document` (see below) |
 
 The three layout forms are a protobuf `oneof`, so "both" cannot be expressed on
@@ -258,8 +258,9 @@ Every table here says which copybook record it holds, heading or not.
 **Use it with a bounded `max_records`.** A Document is one protobuf message and
 a mainframe extract is not: the fold has to hold every row it folds until the
 parse ends, which is the exact opposite of what the row stream exists for. The
-fold therefore caps itself at 100,000 rows per record schema. Rows past the cap
-are counted, not folded, and the trailer carries a
+fold therefore caps itself at 100,000 rows per record schema, and at an
+estimated 64 MiB of Document across all schemas, which is what bounds a wide
+layout. Rows past either cap are counted, not folded, and the trailer carries a
 `WARNING_CODE_DOCUMENT_ROWS_TRUNCATED` warning naming the schema, the dropped
 count, and the byte offset of the first dropped record, with the same count in
 that table's `data.record_layout.rows_truncated`. Nothing is capped
@@ -449,6 +450,7 @@ All optional; see `src/main.rs`.
 | `GRPC_EBCDIC_WORKERS` | CPU count | tokio worker threads |
 | `GRPC_EBCDIC_MAX_DOCUMENT_MIB` | `512` | byte cap when the request sets none |
 | `GRPC_EBCDIC_MAX_CONCURRENT_PARSES` | `64` | parses admitted at once; past it, refused not queued |
+| `GRPC_EBCDIC_IDLE_TIMEOUT_SECONDS` | `30` | longest wait for the next request frame, or for the client to take the next event; past it the parse ends with `DEADLINE_EXCEEDED` and frees its slot |
 | `GRPC_EBCDIC_METRICS_INTERVAL_SECONDS` | `60` | metrics line interval; `0` disables |
 | `GRPC_EBCDIC_WINDOW_BYTES` | 16 MiB | HTTP/2 initial stream and connection window |
 

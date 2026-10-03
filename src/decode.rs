@@ -193,7 +193,8 @@ pub fn decode_zoned(bytes: &[u8]) -> Result<i128, ParseError> {
 /// # Errors
 ///
 /// [`ParseError::Invalid`] when the field is empty, and
-/// [`ParseError::Unsupported`] past [`MAX_BINARY_BYTES`].
+/// [`ParseError::Unsupported`] past [`MAX_BINARY_BYTES`], or for an unsigned
+/// value too large for an `i128`.
 pub fn decode_binary(bytes: &[u8], signed: bool) -> Result<i128, ParseError> {
     if bytes.is_empty() {
         return Err(ParseError::invalid(
@@ -204,6 +205,14 @@ pub fn decode_binary(bytes: &[u8], signed: bool) -> Result<i128, ParseError> {
         return Err(ParseError::unsupported(format!(
             "binary fields wider than {MAX_BINARY_BYTES} bytes are not supported (got {})",
             bytes.len()
+        )));
+    }
+    // An unsigned field as wide as the accumulator with its top bit set is a
+    // value above `i128::MAX`; folding it would wrap it negative.
+    if !signed && bytes.len() == MAX_BINARY_BYTES as usize && (bytes[0] & 0x80) != 0 {
+        return Err(ParseError::unsupported(format!(
+            "unsigned binary value {} exceeds the largest number this build carries",
+            hex(bytes)
         )));
     }
     let negative = signed && (bytes[0] & 0x80) != 0;
@@ -327,6 +336,19 @@ mod tests {
         );
         assert_eq!(decode_binary(&[0xff; 8], false).unwrap(), u64::MAX.into());
         assert_eq!(decode_binary(&[0xff; 8], true).unwrap(), -1);
+    }
+
+    #[test]
+    fn a_sixteen_byte_unsigned_value_never_comes_back_negative() {
+        // The largest that fits is still exact.
+        let mut most = [0xff_u8; 16];
+        most[0] = 0x7f;
+        assert_eq!(decode_binary(&most, false).unwrap(), i128::MAX);
+        // One bit more used to wrap to a negative number; it is refused.
+        let err = decode_binary(&[0xff; 16], false).unwrap_err();
+        assert!(matches!(err, ParseError::Unsupported(_)), "got {err:?}");
+        // Signed, the same bytes are an ordinary -1.
+        assert_eq!(decode_binary(&[0xff; 16], true).unwrap(), -1);
     }
 
     #[test]

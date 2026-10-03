@@ -25,6 +25,10 @@ pub enum ParseError {
     /// Becomes `RESOURCE_EXHAUSTED`.
     Exhausted(String),
 
+    /// The client left the request stream idle past the server's limit while
+    /// holding a parse slot. Becomes `DEADLINE_EXCEEDED`.
+    TimedOut(String),
+
     /// The server broke, not the request. Becomes `INTERNAL`.
     Internal(String),
 }
@@ -45,6 +49,11 @@ impl ParseError {
         Self::Exhausted(message.to_string())
     }
 
+    /// Build a [`Self::TimedOut`] from anything printable.
+    pub fn timed_out(message: impl std::fmt::Display) -> Self {
+        Self::TimedOut(message.to_string())
+    }
+
     /// Build an [`Self::Internal`] from anything printable.
     pub fn internal(message: impl std::fmt::Display) -> Self {
         Self::Internal(message.to_string())
@@ -57,6 +66,7 @@ impl ParseError {
             Self::Invalid(_) => tonic::Code::InvalidArgument,
             Self::Unsupported(_) => tonic::Code::Unimplemented,
             Self::Exhausted(_) => tonic::Code::ResourceExhausted,
+            Self::TimedOut(_) => tonic::Code::DeadlineExceeded,
             Self::Internal(_) => tonic::Code::Internal,
         }
     }
@@ -68,6 +78,7 @@ impl std::fmt::Display for ParseError {
             Self::Invalid(message)
             | Self::Unsupported(message)
             | Self::Exhausted(message)
+            | Self::TimedOut(message)
             | Self::Internal(message) => f.write_str(message),
         }
     }

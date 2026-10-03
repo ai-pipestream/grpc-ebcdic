@@ -27,6 +27,15 @@ const DEFAULT_RECORD_NAME: &str = "record";
 /// in a container.
 pub const MAX_RECORD_BYTES: u32 = 16 * 1024 * 1024;
 
+/// Most fields one layout may declare, fillers included, across all of its
+/// record schemas.
+///
+/// Every field is a column of every row, a `FieldSchema` in the layout event,
+/// and a cell in the Document fold, so this is what keeps a small layout from
+/// describing a gigantic one. Sixty-five thousand is far past any real
+/// copybook.
+pub const MAX_LAYOUT_FIELDS: usize = 65_536;
+
 /// Largest footer the server will hold back, in bytes.
 ///
 /// Footer bytes cannot be decoded until the input ends, so they are buffered
@@ -379,7 +388,7 @@ pub fn resolve(options: &pb::ParseOptions) -> Result<Layout, ParseError> {
     };
     match source {
         pb::parse_options::LayoutSource::Layout(layout) => {
-            validate(from_proto(layout), pb::LayoutSource::Proto)
+            validate(from_proto(layout)?, pb::LayoutSource::Proto)
         }
         pb::parse_options::LayoutSource::LayoutJson(bytes) => {
             validate(from_json(bytes)?, pb::LayoutSource::Json)
@@ -392,39 +401,47 @@ pub fn resolve(options: &pb::ParseOptions) -> Result<Layout, ParseError> {
 }
 
 /// Lift a protobuf layout into the raw shape.
-fn from_proto(layout: &pb::EbcdicLayout) -> RawLayout {
+///
+/// # Errors
+///
+/// [`ParseError::Unsupported`] for a field type value this build does not
+/// know, which is how a newer client's type arrives. Decoding such a field as
+/// text would hand back code-page gibberish for what is really binary.
+fn from_proto(layout: &pb::EbcdicLayout) -> Result<RawLayout, ParseError> {
     /// Lift one protobuf field.
-    fn field(field: &pb::EbcdicField) -> RawField {
-        RawField {
+    fn field(field: &pb::EbcdicField) -> Result<RawField, ParseError> {
+        let kind = FieldKind::from_proto(field.r#type)
+            .map_err(|err| ParseError::unsupported(format!("field {:?}: {err}", field.name)))?;
+        Ok(RawField {
             name: field.name.clone(),
             size: field.size,
-            // Unknown type values are caught in validation, where the field
-            // name is available for the message.
-            kind: FieldKind::from_proto(field.r#type).unwrap_or(FieldKind::Text),
+            kind,
             scale: field.scale,
             picture: field.picture.clone(),
             offset: field.offset,
             // A protobuf layout is a flat field list: no levels, no groups, no
             // OCCURS. Validation fills the path in from the name.
             declaration: Declaration::default(),
-        }
+        })
     }
-    RawLayout {
+    Ok(RawLayout {
         records: layout
             .records
             .iter()
-            .map(|record| RawRecord {
-                name: record.name.clone(),
-                fields: record.fields.iter().map(field).collect(),
-                selector: record.selector.clone(),
+            .map(|record| {
+                Ok(RawRecord {
+                    name: record.name.clone(),
+                    fields: record.fields.iter().map(field).collect::<Result<_, _>>()?,
+                    selector: record.selector.clone(),
+                })
             })
-            .collect(),
+            .collect::<Result<_, ParseError>>()?,
         description: layout.description.clone(),
         header_size: layout.header_size,
         footer_size: layout.footer_size,
-        record_length_field: layout.record_length_field.as_ref().map(field),
-        record_type_field: layout.record_type_field.as_ref().map(field),
-    }
+        record_length_field: layout.record_length_field.as_ref().map(field).transpose()?,
+        record_type_field: layout.record_type_field.as_ref().map(field).transpose()?,
+    })
 }
 
 /// Docling's `EbcdicFieldType`, as it appears in a serialized layout.
@@ -575,6 +592,42 @@ fn check_width(field: &RawField, context: &str) -> Result<(), ParseError> {
     Ok(())
 }
 
+/// Most digits a binary field can hold: `u128::MAX` has thirty-nine.
+const MAX_BINARY_DIGITS: u32 = 39;
+
+/// Check that a field's implied decimal digits are ones it can actually hold.
+///
+/// The scale is how many zeros a rendered value may be padded with, so an
+/// unchecked one lets a one-byte field allocate gigabytes per cell. No field
+/// can carry more fractional digits than it has digits at all: a packed field
+/// holds two per byte less the sign nibble, a zoned field one per byte, and a
+/// binary field at most [`MAX_BINARY_DIGITS`].
+fn check_scale(field: &RawField, context: &str) -> Result<(), ParseError> {
+    // A filler keeps its picture's scale but is never rendered, so the scale
+    // allocates nothing; `05 FILLER PIC S9(3)V99 COMP-3` is ordinary.
+    if field.scale == 0 || field.kind == FieldKind::Skip {
+        return Ok(());
+    }
+    if !field.kind.is_numeric() {
+        return Err(ParseError::invalid(format!(
+            "{context} field {:?} has scale {} but is not a numeric field",
+            field.name, field.scale
+        )));
+    }
+    let digits = match field.kind {
+        FieldKind::PackedDecimal => field.size.saturating_mul(2).saturating_sub(1),
+        FieldKind::ZonedDecimal => field.size,
+        _ => MAX_BINARY_DIGITS,
+    };
+    if field.scale > digits {
+        return Err(ParseError::invalid(format!(
+            "{context} field {:?} has scale {} but holds at most {digits} digits",
+            field.name, field.scale
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a prefix field: it is read ahead of every record, so it has to be
 /// something a length or a selector can be made of.
 fn prefix_field(raw: RawField, role: &str) -> Result<Field, ParseError> {
@@ -589,6 +642,7 @@ fn prefix_field(raw: RawField, role: &str) -> Result<Field, ParseError> {
         )));
     }
     check_width(&raw, role)?;
+    check_scale(&raw, role)?;
     let name = if raw.name.is_empty() {
         role.to_string()
     } else {
@@ -653,6 +707,14 @@ fn validate(raw: RawLayout, source: pb::LayoutSource) -> Result<Layout, ParseErr
             "a layout with more than one record schema needs a record_type_field to choose \
              between them",
         ));
+    }
+
+    let declared: usize = raw.records.iter().map(|record| record.fields.len()).sum();
+    if declared > MAX_LAYOUT_FIELDS {
+        return Err(ParseError::unsupported(format!(
+            "the layout declares {declared} fields; this build accepts at most \
+             {MAX_LAYOUT_FIELDS}"
+        )));
     }
 
     let mut names = BTreeSet::new();
@@ -733,12 +795,7 @@ fn validate(raw: RawLayout, source: pb::LayoutSource) -> Result<Layout, ParseErr
                     "a field of record {name:?} has no name; only fillers may be anonymous"
                 )));
             }
-            if raw_field.scale != 0 && !raw_field.kind.is_numeric() {
-                return Err(ParseError::invalid(format!(
-                    "field {:?} of record {name:?} has scale {} but is not a numeric field",
-                    raw_field.name, raw_field.scale
-                )));
-            }
+            check_scale(&raw_field, &format!("record {name:?}"))?;
             // A flat layout form declares no path, so the field name is the
             // whole of it: a consumer reads `path` without asking which form
             // the layout arrived in.
@@ -946,6 +1003,104 @@ mod tests {
         let filler = layout.records[0].fields[2].clone();
         layout.records[0].fields.push(filler);
         resolve(&options(layout)).expect("two anonymous fillers are fine");
+    }
+
+    #[test]
+    fn an_unknown_field_type_is_unimplemented_not_text() {
+        // A newer client's type, such as a float or native binary, must not
+        // be decoded as character data.
+        let mut layout = sample_layout();
+        layout.records[0].fields[1].r#type = 99;
+        let err = resolve(&options(layout)).unwrap_err();
+        assert!(
+            matches!(&err, ParseError::Unsupported(m) if m.contains("99") && m.contains("BALANCE")),
+            "got {err:?}"
+        );
+
+        // The prefix fields go through the same path.
+        let mut layout = sample_layout();
+        layout.record_type_field = Some(pb::EbcdicField {
+            name: "KIND".into(),
+            size: 1,
+            r#type: 42,
+            ..Default::default()
+        });
+        let err = resolve(&options(layout)).unwrap_err();
+        assert!(matches!(err, ParseError::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_filler_with_an_implied_decimal_still_resolves() {
+        // FILLER keeps its picture's scale but is skipped, never rendered.
+        let copybook = "       01 REC.\n\
+                        \x20          05 A PIC X.\n\
+                        \x20          05 FILLER PIC S9(3)V99 COMP-3.\n";
+        resolve(&pb::ParseOptions {
+            layout_source: Some(pb::parse_options::LayoutSource::Copybook(copybook.into())),
+            ..Default::default()
+        })
+        .expect("a scaled filler is an ordinary copybook");
+    }
+
+    #[test]
+    fn a_scale_past_the_digits_a_field_holds_is_invalid_argument() {
+        // Each rendered cell is padded to `scale` digits, so an unbounded
+        // scale is an allocation per cell of whatever the caller asked for.
+        for (kind, size, most) in [
+            (pb::FieldType::PackedDecimal, 5, 9),
+            (pb::FieldType::ZonedDecimal, 5, 5),
+            (pb::FieldType::Integer, 4, 39),
+        ] {
+            let mut layout = sample_layout();
+            layout.records[0].fields[1].r#type = kind as i32;
+            layout.records[0].fields[1].size = size;
+            layout.records[0].fields[1].scale = most;
+            resolve(&options(layout.clone())).expect("a scale the field can hold");
+            layout.records[0].fields[1].scale = most + 1;
+            let err = resolve(&options(layout)).unwrap_err();
+            assert!(
+                matches!(&err, ParseError::Invalid(m) if m.contains("BALANCE")),
+                "{kind:?}: got {err:?}"
+            );
+        }
+
+        // The JSON form, and the prefix fields, are held to the same bound.
+        let json = br#"{"records":[{"fields":[
+            {"name":"N","size":1,"type":"packed_decimal","scale":4000000000}]}]}"#;
+        let err = resolve(&pb::ParseOptions {
+            layout_source: Some(pb::parse_options::LayoutSource::LayoutJson(json.to_vec())),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(matches!(err, ParseError::Invalid(_)), "got {err:?}");
+        let mut layout = sample_layout();
+        layout.record_type_field = Some(pb::EbcdicField {
+            name: "KIND".into(),
+            size: 1,
+            r#type: pb::FieldType::PackedDecimal as i32,
+            scale: 200_000_000,
+            ..Default::default()
+        });
+        layout.records[0].selector = Some("1".into());
+        let err = resolve(&options(layout)).unwrap_err();
+        assert!(matches!(err, ParseError::Invalid(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_layout_with_too_many_fields_is_unimplemented() {
+        let mut layout = sample_layout();
+        layout.records[0].fields = (0..=super::MAX_LAYOUT_FIELDS)
+            .map(|index| pb::EbcdicField {
+                name: format!("F{index}"),
+                size: 1,
+                ..Default::default()
+            })
+            .collect();
+        let err = resolve(&options(layout)).unwrap_err();
+        assert!(
+            matches!(&err, ParseError::Unsupported(m) if m.contains("fields")),
+            "got {err:?}"
+        );
     }
 
     #[test]

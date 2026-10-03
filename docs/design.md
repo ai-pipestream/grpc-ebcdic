@@ -72,7 +72,8 @@ from the collector itself:
   `ParseEbcdicResponse.event` variant immediately before the `status` trailer.
   The trailer stays last; the `record` events are untouched and remain the
   lossless result.
-- The bound is a per-schema row cap (100,000). Past it rows are counted, not
+- The bound is a per-schema row cap (100,000) and an estimated Document size
+  (64 MiB) shared by every schema. Past either, rows are counted, not
   folded, and the trailer carries `WARNING_CODE_DOCUMENT_ROWS_TRUNCATED`
   naming the schema and the dropped count, with the same count in the table's
   `data.record_layout.rows_truncated`. There is no silent cap. Pair

@@ -42,9 +42,15 @@ pub struct RecordStream {
     layout: Layout,
     /// Decoder settings.
     options: DecodeOptions,
-    /// Bytes received but not yet consumed.
+    /// Bytes received, of which everything from `start` on is not yet
+    /// consumed.
     buffer: Vec<u8>,
-    /// Absolute offset of `buffer[0]` within the input.
+    /// Index of the first unconsumed byte in `buffer`. Consuming a record
+    /// only moves this cursor; the consumed prefix is dropped once per
+    /// [`Self::push`], so a chunk of many short records is not memmoved once
+    /// per record.
+    start: usize,
+    /// Absolute offset of `buffer[start]` within the input.
     buffer_base: u64,
     /// Total bytes received so far.
     received: u64,
@@ -74,6 +80,7 @@ impl RecordStream {
             layout,
             options,
             buffer: Vec::new(),
+            start: 0,
             buffer_base: 0,
             received: 0,
             header_left,
@@ -94,8 +101,12 @@ impl RecordStream {
         if self.truncated {
             self.buffer_base = self.received;
             self.buffer.clear();
+            self.start = 0;
             return;
         }
+        // One compaction per chunk rather than one per record.
+        self.buffer.drain(..self.start);
+        self.start = 0;
         self.buffer.extend_from_slice(chunk);
     }
 
@@ -129,12 +140,17 @@ impl RecordStream {
         // clamp only matters while the footer reserve is still filling.
         usize::try_from(end)
             .unwrap_or(usize::MAX)
-            .min(self.buffer.len())
+            .min(self.pending().len())
     }
 
-    /// Drop `count` consumed bytes from the front of the buffer.
+    /// The unconsumed bytes, starting at `buffer_base`.
+    fn pending(&self) -> &[u8] {
+        &self.buffer[self.start..]
+    }
+
+    /// Mark `count` bytes at the front of the unconsumed input as consumed.
     fn consume(&mut self, count: usize) {
-        self.buffer.drain(..count);
+        self.start += count;
         self.buffer_base += count as u64;
     }
 
@@ -179,7 +195,7 @@ impl RecordStream {
         }
 
         let byte_offset = self.buffer_base;
-        let body = &self.buffer[prefix_size..total];
+        let body = &self.pending()[prefix_size..total];
         let cells = decode_cells(&record, body, &self.options)?;
         let row_index = self
             .rows_per_type
@@ -204,6 +220,7 @@ impl RecordStream {
             self.truncated = true;
             self.buffer_base = self.received;
             self.buffer.clear();
+            self.start = 0;
         }
         Ok(Some(row))
     }
@@ -216,7 +233,7 @@ impl RecordStream {
         let mut cursor = 0usize;
         let mut declared_length: Option<i128> = None;
         if let Some(field) = self.layout.record_length_field.as_ref() {
-            let bytes = &self.buffer[cursor..cursor + field.size as usize];
+            let bytes = &self.pending()[cursor..cursor + field.size as usize];
             let value = decode_field(field, bytes, &self.options)?;
             declared_length = Some(match value {
                 FieldValue::Number { unscaled, .. } => unscaled,
@@ -231,7 +248,7 @@ impl RecordStream {
         }
         let mut record_type: Option<String> = None;
         if let Some(field) = self.layout.record_type_field.as_ref() {
-            let bytes = &self.buffer[cursor..cursor + field.size as usize];
+            let bytes = &self.pending()[cursor..cursor + field.size as usize];
             record_type = Some(decode_field(field, bytes, &self.options)?.to_display_string());
         }
 
@@ -510,6 +527,56 @@ mod tests {
             // the only location an EBCDIC record has.
             assert_eq!(rows[0].byte_length, 4);
         }
+    }
+
+    #[test]
+    fn a_record_split_across_chunks_survives_the_consumed_prefix_being_dropped() {
+        let mut stream = RecordStream::new(simple_layout(), options());
+        let mut bytes = record("AB", "42");
+        bytes.extend(record("CD", "07"));
+        // One whole record and half of the next: the first is consumed, and
+        // the next push drops it from the buffer before appending.
+        stream.push(&bytes[..6]);
+        let first = drain(&mut stream);
+        assert_eq!(first.len(), 1);
+        stream.push(&bytes[6..]);
+        let second = drain(&mut stream);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].byte_offset, 4);
+        assert_eq!(
+            second[0].cells[0].value,
+            Some(pb::cell::Value::Text("CD".into()))
+        );
+        assert_eq!(second[0].cells[1].value, Some(pb::cell::Value::Integer(7)));
+    }
+
+    #[test]
+    fn a_large_chunk_of_short_records_drains_in_linear_time() {
+        // Four MiB is the default gRPC frame. Dropping each record from the
+        // front of the buffer as it is consumed memmoves the rest of the
+        // chunk once per record, which for a million four-byte records is
+        // terabytes of copying; consuming by cursor is one pass.
+        let one = record("AB", "42");
+        let chunk: Vec<u8> = one.iter().copied().cycle().take(4 * 1024 * 1024).collect();
+        let mut stream = RecordStream::new(simple_layout(), options());
+        let started = std::time::Instant::now();
+        stream.push(&chunk);
+        let mut rows = 0u64;
+        // Checked inside the loop: a quadratic drain would otherwise hang
+        // the test for hours instead of failing it.
+        while stream.next_record().expect("no decode failure").is_some() {
+            rows += 1;
+            assert!(
+                started.elapsed() < std::time::Duration::from_mins(1),
+                "the drain is not linear: {rows} records after {:?}",
+                started.elapsed()
+            );
+        }
+        assert_eq!(rows, 1024 * 1024);
+        stream.finish_input();
+        let status = stream.status().unwrap();
+        assert_eq!(status.bytes_consumed, 4 * 1024 * 1024);
+        assert_eq!(status.trailing_bytes, 0);
     }
 
     #[test]

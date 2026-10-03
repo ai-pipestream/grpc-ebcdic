@@ -177,7 +177,9 @@ message ParseOptions {
   bool abort_on_error = 7;
 
   // Upper bound on the input, in mebibytes. Zero means the server default.
-  // Exceeding it fails the stream with RESOURCE_EXHAUSTED.
+  // A value above the server default is clamped to it: a request may lower
+  // the operator's cap but not raise it. Exceeding it fails the stream with
+  // RESOURCE_EXHAUSTED.
   uint32 max_document_mib = 8;
 
   // Also fold the parse into a single `ai.pipestream.document.v1.Document`
@@ -188,10 +190,11 @@ message ParseOptions {
   // it set the server accumulates every folded row in memory until the parse
   // ends, because a Document is one protobuf message and a message cannot be
   // streamed. That is the opposite of what the row stream is for, so pair
-  // this with `max_records` — or accept the server's per-schema fold cap,
-  // which drops the surplus rows and reports
-  // WARNING_CODE_DOCUMENT_ROWS_TRUNCATED in the trailer. The `record` events
-  // are unaffected either way: they remain the complete, lossless result.
+  // this with `max_records` — or accept the server's fold caps (rows per
+  // schema, and an estimated size for the whole Document), which drop the
+  // surplus rows and report WARNING_CODE_DOCUMENT_ROWS_TRUNCATED in the
+  // trailer. The `record` events are unaffected either way: they remain the
+  // complete, lossless result.
   bool emit_document = 9;
 }
 
@@ -425,7 +428,8 @@ enum WarningCode {
   WARNING_CODE_INPUT_SHORTER_THAN_BOUNDARIES = 3;
 
   // `emit_document` was set and one record schema produced more rows than the
-  // server folds into a single Document, so the surplus rows are missing from
+  // server folds into a single Document, by its per-schema row cap or by the
+  // Document's estimated size, so the surplus rows are missing from
   // that schema's table. The `message` names the schema and how many rows were
   // dropped, and the table's `meta.custom_fields["ebcdic.rows_truncated"]`
   // carries the same count; `byte_offset` is where the first dropped record

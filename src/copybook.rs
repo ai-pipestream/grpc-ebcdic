@@ -41,7 +41,8 @@
 
 use crate::error::ParseError;
 use crate::layout::{
-    ConditionName, ConditionValue, Declaration, FieldKind, RawField, RawLayout, RawRecord,
+    ConditionName, ConditionValue, Declaration, FieldKind, MAX_LAYOUT_FIELDS, MAX_RECORD_BYTES,
+    RawField, RawLayout, RawRecord,
 };
 
 /// Largest `OCCURS` count the compiler will expand.
@@ -49,6 +50,12 @@ use crate::layout::{
 /// Each occurrence becomes a real field with a real name, so this bounds the
 /// work a one-line copybook can ask for.
 const MAX_OCCURS: u32 = 4096;
+
+/// Most level-88 condition values the expanded record may carry in total.
+///
+/// A condition under an `OCCURS` item is copied onto every occurrence, so
+/// this bounds the copies rather than the source.
+const MAX_CONDITION_VALUES: u64 = 262_144;
 
 /// Compile copybook source into the raw layout shape.
 ///
@@ -232,8 +239,14 @@ fn strip_card_columns(line: &str) -> Option<&str> {
     if matches!(bytes[6], b'*' | b'/') {
         return None;
     }
-    // Columns 73-80 are the identification area and are not code.
-    let end = line.len().min(72);
+    // Columns 73-80 are the identification area and are not code. Columns
+    // are characters, not bytes: a national literal or comment near the
+    // margin must not put the cut inside a multi-byte character. The first
+    // seven columns were checked to be ASCII above, so byte 6 is a boundary.
+    let end = line
+        .char_indices()
+        .nth(72)
+        .map_or(line.len(), |(index, _)| index);
     Some(&line[6..end])
 }
 
@@ -575,6 +588,11 @@ fn is_clause_keyword(token: &str) -> bool {
 fn flatten(items: &[Item], out: &mut Vec<RawField>) -> Result<(), ParseError> {
     // The group items currently open, innermost last, as (level, name).
     let mut groups: Vec<(u8, String)> = Vec::new();
+    // The record so far, checked before each expansion rather than after the
+    // whole record, so a copybook of OCCURS items cannot allocate millions of
+    // fields before validation gets to see their sum.
+    let mut record_bytes: u64 = 0;
+    let mut condition_values: u64 = 0;
     for (index, item) in items.iter().enumerate() {
         groups.retain(|(level, _)| *level < item.level);
         let label = item.name.clone().unwrap_or_else(|| "FILLER".to_string());
@@ -632,6 +650,31 @@ fn flatten(items: &[Item], out: &mut Vec<RawField>) -> Result<(), ParseError> {
         // index is a number again rather than something to parse back out of
         // a column name.
         let occurrences = item.occurs.unwrap_or(1);
+        record_bytes += u64::from(described.size) * u64::from(occurrences);
+        if record_bytes > u64::from(MAX_RECORD_BYTES) {
+            return Err(ParseError::unsupported(format!(
+                "the record reaches {record_bytes} bytes at {label:?}; this build decodes \
+                 records up to {MAX_RECORD_BYTES} bytes"
+            )));
+        }
+        if out.len() + occurrences as usize > MAX_LAYOUT_FIELDS {
+            return Err(ParseError::unsupported(format!(
+                "the record expands to more than {MAX_LAYOUT_FIELDS} fields at {label:?}; this \
+                 build accepts at most {MAX_LAYOUT_FIELDS}"
+            )));
+        }
+        let per_occurrence: u64 = item
+            .conditions
+            .iter()
+            .map(|condition| 1 + condition.values.len() as u64)
+            .sum();
+        condition_values += per_occurrence * u64::from(occurrences);
+        if condition_values > MAX_CONDITION_VALUES {
+            return Err(ParseError::unsupported(format!(
+                "the record's level-88 conditions expand to more than {MAX_CONDITION_VALUES} \
+                 values at {label:?}; this build accepts at most {MAX_CONDITION_VALUES}"
+            )));
+        }
         for occurrence in 1..=occurrences {
             let leaf = match item.name.as_ref() {
                 None => String::new(),
@@ -934,6 +977,49 @@ mod tests {
                 .map(|f| (f.name.as_str(), f.size))
                 .collect::<Vec<_>>(),
             vec![("STREET", 20), ("CITY", 10), ("ZIP", 5)]
+        );
+    }
+
+    #[test]
+    fn occurs_expansion_is_bounded_before_it_allocates() {
+        use std::fmt::Write as _;
+
+        // Two thousand lines of OCCURS 4096 is a 60 KB copybook describing
+        // over eight million one-byte fields. It used to be accepted.
+        let mut source = String::from("01 REC.\n");
+        for index in 0..2000 {
+            writeln!(source, "05 A{index} PIC X OCCURS 4096.").unwrap();
+        }
+        let started = std::time::Instant::now();
+        let err = compile(&source).unwrap_err();
+        assert!(
+            matches!(&err, ParseError::Unsupported(m) if m.contains("fields")),
+            "got {err:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "refused only after {:?}",
+            started.elapsed()
+        );
+
+        // Wide occurrences hit the record byte limit the same way.
+        let source = "01 REC.\n05 A PIC X(4096) OCCURS 4096.\n05 B PIC X(4096) OCCURS 4096.\n";
+        let err = compile(source).unwrap_err();
+        assert!(
+            matches!(&err, ParseError::Unsupported(m) if m.contains("bytes")),
+            "got {err:?}"
+        );
+
+        // Level-88 conditions are copied onto every occurrence, so their
+        // copies are bounded as well.
+        let mut source = String::from("01 REC.\n05 A PIC X OCCURS 4096.\n");
+        for index in 0..100 {
+            writeln!(source, "88 C{index} VALUE 'X'.").unwrap();
+        }
+        let err = compile(&source).unwrap_err();
+        assert!(
+            matches!(&err, ParseError::Unsupported(m) if m.contains("level-88")),
+            "got {err:?}"
         );
     }
 
@@ -1250,6 +1336,26 @@ mod tests {
             matches!(&err, ParseError::Unsupported(m) if m.contains("record_type_field")),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn a_multi_byte_character_at_column_72_is_cut_by_character_not_byte() {
+        // A national literal that ends at the margin: columns 68-70 are
+        // two-byte letters, so byte 72 falls inside the third of them while
+        // the closing quote and period still sit in columns 71 and 72. Cutting
+        // at byte 72 used to panic the handler.
+        let condition = format!("{:<66}'ééé'.", "           88  ACCENT VALUE");
+        assert_eq!(condition.chars().count(), 72);
+        assert!(!condition.is_char_boundary(72));
+        let source = format!(
+            "{:<72}\n{:<72}\n{condition}IDENT\n",
+            "       01  REC.", "           05  F  PIC X(3)."
+        );
+        let record = &compile(&source).unwrap().records[0];
+        assert_eq!(record.fields.len(), 1);
+        let conditions = &record.fields[0].declaration.conditions;
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].values[0].low, "ééé");
     }
 
     #[test]

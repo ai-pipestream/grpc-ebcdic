@@ -10,6 +10,9 @@
 //!   not set one (default 512). Exceeding it is `RESOURCE_EXHAUSTED`.
 //! - `GRPC_EBCDIC_MAX_CONCURRENT_PARSES` — parse streams admitted at once
 //!   (default 64). Past the cap a call is refused, not queued.
+//! - `GRPC_EBCDIC_IDLE_TIMEOUT_SECONDS` — longest wait for the next request
+//!   frame, or for the client to take the next event, before the parse ends
+//!   with `DEADLINE_EXCEEDED` (default 30, minimum 1).
 //! - `GRPC_EBCDIC_METRICS_INTERVAL_SECONDS` — seconds between metrics lines on
 //!   stdout (default 60; `0` disables them).
 //! - `GRPC_EBCDIC_WINDOW_BYTES` — HTTP/2 initial stream and connection window
@@ -87,9 +90,18 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     ))
     .unwrap_or(grpc_ebcdic::service::DEFAULT_MAX_CONCURRENT_PARSES);
 
+    let idle_timeout = Duration::from_secs(
+        env_u64(
+            "GRPC_EBCDIC_IDLE_TIMEOUT_SECONDS",
+            grpc_ebcdic::service::DEFAULT_IDLE_TIMEOUT_SECONDS,
+        )
+        .max(1),
+    );
+
     let grpc = EbcdicGrpc::new(std::sync::Arc::clone(&metrics))
         .with_max_document_mib(max_document_mib)
-        .with_max_concurrent_parses(max_parses);
+        .with_max_concurrent_parses(max_parses)
+        .with_idle_timeout(idle_timeout);
 
     let window = u32::try_from(env_u64(
         "GRPC_EBCDIC_WINDOW_BYTES",
