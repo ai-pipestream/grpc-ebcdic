@@ -232,8 +232,14 @@ fn strip_card_columns(line: &str) -> Option<&str> {
     if matches!(bytes[6], b'*' | b'/') {
         return None;
     }
-    // Columns 73-80 are the identification area and are not code.
-    let end = line.len().min(72);
+    // Columns 73-80 are the identification area and are not code. Columns
+    // are characters, not bytes: a national literal or comment near the
+    // margin must not put the cut inside a multi-byte character. The first
+    // seven columns were checked to be ASCII above, so byte 6 is a boundary.
+    let end = line
+        .char_indices()
+        .nth(72)
+        .map_or(line.len(), |(index, _)| index);
     Some(&line[6..end])
 }
 
@@ -1250,6 +1256,26 @@ mod tests {
             matches!(&err, ParseError::Unsupported(m) if m.contains("record_type_field")),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn a_multi_byte_character_at_column_72_is_cut_by_character_not_byte() {
+        // A national literal that ends at the margin: columns 68-70 are
+        // two-byte letters, so byte 72 falls inside the third of them while
+        // the closing quote and period still sit in columns 71 and 72. Cutting
+        // at byte 72 used to panic the handler.
+        let condition = format!("{:<66}'ééé'.", "           88  ACCENT VALUE");
+        assert_eq!(condition.chars().count(), 72);
+        assert!(!condition.is_char_boundary(72));
+        let source = format!(
+            "{:<72}\n{:<72}\n{condition}IDENT\n",
+            "       01  REC.", "           05  F  PIC X(3)."
+        );
+        let record = &compile(&source).unwrap().records[0];
+        assert_eq!(record.fields.len(), 1);
+        let conditions = &record.fields[0].declaration.conditions;
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].values[0].low, "ééé");
     }
 
     #[test]
