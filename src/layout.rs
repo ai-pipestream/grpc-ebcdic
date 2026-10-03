@@ -379,7 +379,7 @@ pub fn resolve(options: &pb::ParseOptions) -> Result<Layout, ParseError> {
     };
     match source {
         pb::parse_options::LayoutSource::Layout(layout) => {
-            validate(from_proto(layout), pb::LayoutSource::Proto)
+            validate(from_proto(layout)?, pb::LayoutSource::Proto)
         }
         pb::parse_options::LayoutSource::LayoutJson(bytes) => {
             validate(from_json(bytes)?, pb::LayoutSource::Json)
@@ -392,39 +392,47 @@ pub fn resolve(options: &pb::ParseOptions) -> Result<Layout, ParseError> {
 }
 
 /// Lift a protobuf layout into the raw shape.
-fn from_proto(layout: &pb::EbcdicLayout) -> RawLayout {
+///
+/// # Errors
+///
+/// [`ParseError::Unsupported`] for a field type value this build does not
+/// know, which is how a newer client's type arrives. Decoding such a field as
+/// text would hand back code-page gibberish for what is really binary.
+fn from_proto(layout: &pb::EbcdicLayout) -> Result<RawLayout, ParseError> {
     /// Lift one protobuf field.
-    fn field(field: &pb::EbcdicField) -> RawField {
-        RawField {
+    fn field(field: &pb::EbcdicField) -> Result<RawField, ParseError> {
+        let kind = FieldKind::from_proto(field.r#type)
+            .map_err(|err| ParseError::unsupported(format!("field {:?}: {err}", field.name)))?;
+        Ok(RawField {
             name: field.name.clone(),
             size: field.size,
-            // Unknown type values are caught in validation, where the field
-            // name is available for the message.
-            kind: FieldKind::from_proto(field.r#type).unwrap_or(FieldKind::Text),
+            kind,
             scale: field.scale,
             picture: field.picture.clone(),
             offset: field.offset,
             // A protobuf layout is a flat field list: no levels, no groups, no
             // OCCURS. Validation fills the path in from the name.
             declaration: Declaration::default(),
-        }
+        })
     }
-    RawLayout {
+    Ok(RawLayout {
         records: layout
             .records
             .iter()
-            .map(|record| RawRecord {
-                name: record.name.clone(),
-                fields: record.fields.iter().map(field).collect(),
-                selector: record.selector.clone(),
+            .map(|record| {
+                Ok(RawRecord {
+                    name: record.name.clone(),
+                    fields: record.fields.iter().map(field).collect::<Result<_, _>>()?,
+                    selector: record.selector.clone(),
+                })
             })
-            .collect(),
+            .collect::<Result<_, ParseError>>()?,
         description: layout.description.clone(),
         header_size: layout.header_size,
         footer_size: layout.footer_size,
-        record_length_field: layout.record_length_field.as_ref().map(field),
-        record_type_field: layout.record_type_field.as_ref().map(field),
-    }
+        record_length_field: layout.record_length_field.as_ref().map(field).transpose()?,
+        record_type_field: layout.record_type_field.as_ref().map(field).transpose()?,
+    })
 }
 
 /// Docling's `EbcdicFieldType`, as it appears in a serialized layout.
@@ -946,6 +954,30 @@ mod tests {
         let filler = layout.records[0].fields[2].clone();
         layout.records[0].fields.push(filler);
         resolve(&options(layout)).expect("two anonymous fillers are fine");
+    }
+
+    #[test]
+    fn an_unknown_field_type_is_unimplemented_not_text() {
+        // A newer client's type, such as a float or native binary, must not
+        // be decoded as character data.
+        let mut layout = sample_layout();
+        layout.records[0].fields[1].r#type = 99;
+        let err = resolve(&options(layout)).unwrap_err();
+        assert!(
+            matches!(&err, ParseError::Unsupported(m) if m.contains("99") && m.contains("BALANCE")),
+            "got {err:?}"
+        );
+
+        // The prefix fields go through the same path.
+        let mut layout = sample_layout();
+        layout.record_type_field = Some(pb::EbcdicField {
+            name: "KIND".into(),
+            size: 1,
+            r#type: 42,
+            ..Default::default()
+        });
+        let err = resolve(&options(layout)).unwrap_err();
+        assert!(matches!(err, ParseError::Unsupported(_)), "got {err:?}");
     }
 
     #[test]
