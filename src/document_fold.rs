@@ -71,8 +71,11 @@
 //!
 //! - **Bounded.** A Document is one protobuf message and a mainframe extract
 //!   is not. The fold holds every row it folds, so it caps the rows per schema
-//!   at [`DEFAULT_ROW_CAP`] and reports what it dropped through the parse's own
-//!   warning channel rather than quietly shortening a table.
+//!   at [`DEFAULT_ROW_CAP`], caps the estimated size of the whole Document at
+//!   [`DEFAULT_BYTE_CAP`] across every schema, and reports what it dropped
+//!   through the parse's own warning channel rather than quietly shortening a
+//!   table. The byte cap is what bounds a wide layout: a row cap alone lets a
+//!   thousand one-byte columns turn 100 MB of input into a 4 GB Document.
 //! - **Merge-safe.** The coordinator merges fragments additively and renumbers
 //!   refs, so the fragment must be self-contained: dense local numbering, every
 //!   `self_ref` unique, every parent/child link symmetric, no reference to
@@ -103,6 +106,23 @@ pub const SCHEMA_NAME: &str = "docling_document_v2";
 /// point — the cap exists so the failure is a counted, reported truncation
 /// rather than a message nobody can receive.
 pub const DEFAULT_ROW_CAP: u64 = 100_000;
+
+/// Estimated encoded size of one Document the fold will build, in bytes,
+/// across every schema.
+///
+/// The row cap bounds rows, not cells: a layout of a thousand one-byte
+/// columns is a thousand cells per row, and each cell is a message with its
+/// own text, value and grid coordinates, written twice (flat cells and grid).
+/// Past this budget rows are counted and dropped exactly as past the row cap.
+pub const DEFAULT_BYTE_CAP: u64 = 64 * 1024 * 1024;
+
+/// Estimated encoded bytes of one table cell beyond its text: the message
+/// framing, the spans and offsets, and a numeric value.
+const CELL_OVERHEAD_BYTES: u64 = 32;
+
+/// Estimated encoded bytes of one row beyond its cells: the row message and
+/// its provenance entry.
+const ROW_OVERHEAD_BYTES: u64 = 32;
 
 /// JSON-Pointer self reference of the body group.
 const BODY_REF: &str = "#/body";
@@ -167,6 +187,14 @@ pub struct DocumentFold {
     model: Option<String>,
     /// Rows folded per schema before the surplus is counted instead.
     row_cap: u64,
+    /// Estimated Document bytes folded, across every schema, before the
+    /// surplus is counted instead.
+    byte_cap: u64,
+    /// Estimated Document bytes folded so far.
+    bytes: u64,
+    /// Whether a row has already been refused for the byte budget. Once it
+    /// has, every later row is too, so each table stays a prefix of its rows.
+    budget_spent: bool,
     /// The parse-wide half of every table's `TableData.record_layout`: the
     /// code page and the three byte trims, which the layout states once and
     /// every schema decoded with it shares. The per-schema half, the record
@@ -208,6 +236,9 @@ impl DocumentFold {
             version: version.into(),
             model: None,
             row_cap: DEFAULT_ROW_CAP,
+            byte_cap: DEFAULT_BYTE_CAP,
+            bytes: 0,
+            budget_spent: false,
             layout: doc::RecordLayoutMeta::default(),
             tables: Vec::new(),
             index_by_schema: BTreeMap::new(),
@@ -223,6 +254,14 @@ impl DocumentFold {
     #[must_use]
     pub const fn with_row_cap(mut self, rows: u64) -> Self {
         self.row_cap = rows;
+        self
+    }
+
+    /// Override the estimated Document size, in bytes, past which rows are
+    /// counted instead of folded.
+    #[must_use]
+    pub const fn with_byte_cap(mut self, bytes: u64) -> Self {
+        self.byte_cap = bytes;
         self
     }
 
@@ -261,10 +300,16 @@ impl DocumentFold {
             .map(|state| pb::ParseWarning {
                 code: pb::WarningCode::DocumentRowsTruncated as i32,
                 message: format!(
-                    "record schema {:?} produced {} rows past the {}-row Document fold cap; its \
-                     table holds the first {} and {} were dropped. Every row was sent as a \
-                     `record` event, so re-run with a smaller max_records for a whole Document.",
-                    state.name, state.dropped, self.row_cap, state.rows, state.dropped
+                    "record schema {:?} produced {} rows past the Document fold cap ({} rows \
+                     per schema, about {} bytes per Document); its table holds the first {} and \
+                     {} were dropped. Every row was sent as a `record` event, so re-run with a \
+                     smaller max_records for a whole Document.",
+                    state.name,
+                    state.dropped,
+                    self.row_cap,
+                    self.byte_cap,
+                    state.rows,
+                    state.dropped
                 ),
                 byte_offset: state.first_dropped_offset,
             })
@@ -407,15 +452,16 @@ impl DocumentFold {
             return;
         };
         let state = &mut self.tables[index];
-        if state.rows >= self.row_cap {
+        let drop_row = |state: &mut TableState| {
             if state.dropped == 0 {
                 state.first_dropped_offset = row.byte_offset;
             }
             state.dropped += 1;
+        };
+        if state.rows >= self.row_cap || self.budget_spent {
+            drop_row(state);
             return;
         }
-        let grid_row = state.rows + 1;
-        state.rows += 1;
         // Cells arrive named, so they are placed by name rather than by
         // position: a short row leaves its columns empty instead of shifting
         // every later value one column to the left.
@@ -426,6 +472,26 @@ impl DocumentFold {
                 values[column] = (cell_text(cell), cell_value(cell));
             }
         }
+        // Every cell is written twice, once in the flat cell list and once in
+        // the grid, and a table's first row also brings its header row.
+        let cells_cost = |texts: &mut dyn Iterator<Item = usize>| -> u64 {
+            texts
+                .map(|len| 2 * (len as u64 + CELL_OVERHEAD_BYTES))
+                .sum::<u64>()
+                + ROW_OVERHEAD_BYTES
+        };
+        let mut cost = cells_cost(&mut values.iter().map(|(text, _)| text.len()));
+        if state.rows == 0 {
+            cost += cells_cost(&mut state.columns.iter().map(|column| column.name.len()));
+        }
+        if self.bytes.saturating_add(cost) > self.byte_cap {
+            self.budget_spent = true;
+            drop_row(state);
+            return;
+        }
+        self.bytes += cost;
+        let grid_row = state.rows + 1;
+        state.rows += 1;
 
         let cells: Vec<doc::TableCell> = values
             .into_iter()
@@ -1943,6 +2009,96 @@ mod tests {
         // A byte width is not a display width, and this collector has no page
         // to measure one on.
         assert!(declared.iter().all(|column| column.width.is_none()));
+    }
+
+    /// Fold `data` and return the warnings beside the Document.
+    fn fold_with_warnings(
+        options: &pb::ParseOptions,
+        data: &[u8],
+        mut fold: DocumentFold,
+    ) -> (Vec<pb::ParseWarning>, doc::Document) {
+        let layout = layout::resolve(options).expect("the layout resolves");
+        fold.consume(&pb::parse_ebcdic_response::Event::LayoutInfo(
+            layout.to_layout_info("cp037"),
+        ));
+        let mut walk = RecordStream::new(layout, decode_options());
+        walk.push(data);
+        while let Some(row) = walk.next_record().expect("no decode failure") {
+            fold.consume(&pb::parse_ebcdic_response::Event::Record(row));
+        }
+        let warnings = fold.truncation_warnings();
+        (warnings, fold.take())
+    }
+
+    #[test]
+    fn a_wide_layout_is_bounded_by_bytes_not_only_by_rows() {
+        // A thousand one-byte columns: the row cap alone would fold all of
+        // these rows, a thousand cells each, which at scale turned 100 MB of
+        // input into a Document over 4 GB.
+        let layout = pb::EbcdicLayout {
+            records: vec![pb::EbcdicRecordLayout {
+                name: "WIDE".into(),
+                fields: (0..1000)
+                    .map(|index| pb::EbcdicField {
+                        name: format!("F{index}"),
+                        size: 1,
+                        r#type: pb::FieldType::String as i32,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let data = vec![0xc1_u8; 1000 * 200];
+        let cap = 4 * 1024 * 1024;
+        let (warnings, document) = fold_with_warnings(
+            &options(layout),
+            &data,
+            DocumentFold::new(VERSION).with_byte_cap(cap),
+        );
+        assert_eq!(integrity_errors(&document), Vec::<String>::new());
+
+        let table = &document.tables[0];
+        let kept = table.data.as_ref().unwrap().num_rows - 1;
+        let dropped = record_layout(table).rows_truncated.unwrap();
+        assert!(kept > 0 && dropped > 0, "kept {kept}, dropped {dropped}");
+        assert_eq!(u64::try_from(kept).unwrap() + dropped, 200);
+        // The estimate is an upper bound on what is actually delivered.
+        let encoded = prost::Message::encoded_len(&document) as u64;
+        assert!(encoded <= cap, "{encoded} bytes past a {cap}-byte cap");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(
+            warnings[0].code,
+            pb::WarningCode::DocumentRowsTruncated as i32
+        );
+        assert!(warnings[0].message.contains("WIDE"), "{warnings:?}");
+    }
+
+    #[test]
+    fn the_byte_cap_is_shared_by_every_schema() {
+        // Customers spend the budget, so the orders after them are dropped
+        // even though their own schema has folded nothing yet.
+        let mut data = Vec::new();
+        for name in ["AAAA", "BBBB", "CCCC", "DDDD"] {
+            data.extend(customer(name, [0x00, 0x10, 0x0c]));
+        }
+        data.extend(order("007"));
+        let (warnings, document) = fold_with_warnings(
+            &options(two_schema_layout()),
+            &data,
+            DocumentFold::new(VERSION).with_byte_cap(600),
+        );
+        assert_eq!(integrity_errors(&document), Vec::<String>::new());
+        let customers = &document.tables[0];
+        assert!(customers.data.as_ref().unwrap().num_rows > 1);
+        assert!(record_layout(customers).rows_truncated.unwrap() > 0);
+        // The order schema occurred, so it still has a table that says all of
+        // its rows were dropped.
+        let orders = &document.tables[1];
+        assert_eq!(orders.data.as_ref().unwrap().num_rows, 1, "header only");
+        assert_eq!(record_layout(orders).rows_truncated, Some(1));
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
     }
 
     #[test]

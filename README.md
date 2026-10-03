@@ -258,8 +258,9 @@ Every table here says which copybook record it holds, heading or not.
 **Use it with a bounded `max_records`.** A Document is one protobuf message and
 a mainframe extract is not: the fold has to hold every row it folds until the
 parse ends, which is the exact opposite of what the row stream exists for. The
-fold therefore caps itself at 100,000 rows per record schema. Rows past the cap
-are counted, not folded, and the trailer carries a
+fold therefore caps itself at 100,000 rows per record schema, and at an
+estimated 64 MiB of Document across all schemas, which is what bounds a wide
+layout. Rows past either cap are counted, not folded, and the trailer carries a
 `WARNING_CODE_DOCUMENT_ROWS_TRUNCATED` warning naming the schema, the dropped
 count, and the byte offset of the first dropped record, with the same count in
 that table's `data.record_layout.rows_truncated`. Nothing is capped
