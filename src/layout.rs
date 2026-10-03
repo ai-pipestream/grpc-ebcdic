@@ -27,6 +27,15 @@ const DEFAULT_RECORD_NAME: &str = "record";
 /// in a container.
 pub const MAX_RECORD_BYTES: u32 = 16 * 1024 * 1024;
 
+/// Most fields one layout may declare, fillers included, across all of its
+/// record schemas.
+///
+/// Every field is a column of every row, a `FieldSchema` in the layout event,
+/// and a cell in the Document fold, so this is what keeps a small layout from
+/// describing a gigantic one. Sixty-five thousand is far past any real
+/// copybook.
+pub const MAX_LAYOUT_FIELDS: usize = 65_536;
+
 /// Largest footer the server will hold back, in bytes.
 ///
 /// Footer bytes cannot be decoded until the input ends, so they are buffered
@@ -698,6 +707,14 @@ fn validate(raw: RawLayout, source: pb::LayoutSource) -> Result<Layout, ParseErr
         ));
     }
 
+    let declared: usize = raw.records.iter().map(|record| record.fields.len()).sum();
+    if declared > MAX_LAYOUT_FIELDS {
+        return Err(ParseError::unsupported(format!(
+            "the layout declares {declared} fields; this build accepts at most \
+             {MAX_LAYOUT_FIELDS}"
+        )));
+    }
+
     let mut names = BTreeSet::new();
     let mut selectors = BTreeSet::new();
     let mut records = Vec::with_capacity(raw.records.len());
@@ -1052,6 +1069,23 @@ mod tests {
         layout.records[0].selector = Some("1".into());
         let err = resolve(&options(layout)).unwrap_err();
         assert!(matches!(err, ParseError::Invalid(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_layout_with_too_many_fields_is_unimplemented() {
+        let mut layout = sample_layout();
+        layout.records[0].fields = (0..=super::MAX_LAYOUT_FIELDS)
+            .map(|index| pb::EbcdicField {
+                name: format!("F{index}"),
+                size: 1,
+                ..Default::default()
+            })
+            .collect();
+        let err = resolve(&options(layout)).unwrap_err();
+        assert!(
+            matches!(&err, ParseError::Unsupported(m) if m.contains("fields")),
+            "got {err:?}"
+        );
     }
 
     #[test]

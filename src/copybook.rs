@@ -41,7 +41,8 @@
 
 use crate::error::ParseError;
 use crate::layout::{
-    ConditionName, ConditionValue, Declaration, FieldKind, RawField, RawLayout, RawRecord,
+    ConditionName, ConditionValue, Declaration, FieldKind, MAX_LAYOUT_FIELDS, MAX_RECORD_BYTES,
+    RawField, RawLayout, RawRecord,
 };
 
 /// Largest `OCCURS` count the compiler will expand.
@@ -49,6 +50,12 @@ use crate::layout::{
 /// Each occurrence becomes a real field with a real name, so this bounds the
 /// work a one-line copybook can ask for.
 const MAX_OCCURS: u32 = 4096;
+
+/// Most level-88 condition values the expanded record may carry in total.
+///
+/// A condition under an `OCCURS` item is copied onto every occurrence, so
+/// this bounds the copies rather than the source.
+const MAX_CONDITION_VALUES: u64 = 262_144;
 
 /// Compile copybook source into the raw layout shape.
 ///
@@ -581,6 +588,11 @@ fn is_clause_keyword(token: &str) -> bool {
 fn flatten(items: &[Item], out: &mut Vec<RawField>) -> Result<(), ParseError> {
     // The group items currently open, innermost last, as (level, name).
     let mut groups: Vec<(u8, String)> = Vec::new();
+    // The record so far, checked before each expansion rather than after the
+    // whole record, so a copybook of OCCURS items cannot allocate millions of
+    // fields before validation gets to see their sum.
+    let mut record_bytes: u64 = 0;
+    let mut condition_values: u64 = 0;
     for (index, item) in items.iter().enumerate() {
         groups.retain(|(level, _)| *level < item.level);
         let label = item.name.clone().unwrap_or_else(|| "FILLER".to_string());
@@ -638,6 +650,31 @@ fn flatten(items: &[Item], out: &mut Vec<RawField>) -> Result<(), ParseError> {
         // index is a number again rather than something to parse back out of
         // a column name.
         let occurrences = item.occurs.unwrap_or(1);
+        record_bytes += u64::from(described.size) * u64::from(occurrences);
+        if record_bytes > u64::from(MAX_RECORD_BYTES) {
+            return Err(ParseError::unsupported(format!(
+                "the record reaches {record_bytes} bytes at {label:?}; this build decodes \
+                 records up to {MAX_RECORD_BYTES} bytes"
+            )));
+        }
+        if out.len() + occurrences as usize > MAX_LAYOUT_FIELDS {
+            return Err(ParseError::unsupported(format!(
+                "the record expands to more than {MAX_LAYOUT_FIELDS} fields at {label:?}; this \
+                 build accepts at most {MAX_LAYOUT_FIELDS}"
+            )));
+        }
+        let per_occurrence: u64 = item
+            .conditions
+            .iter()
+            .map(|condition| 1 + condition.values.len() as u64)
+            .sum();
+        condition_values += per_occurrence * u64::from(occurrences);
+        if condition_values > MAX_CONDITION_VALUES {
+            return Err(ParseError::unsupported(format!(
+                "the record's level-88 conditions expand to more than {MAX_CONDITION_VALUES} \
+                 values at {label:?}; this build accepts at most {MAX_CONDITION_VALUES}"
+            )));
+        }
         for occurrence in 1..=occurrences {
             let leaf = match item.name.as_ref() {
                 None => String::new(),
@@ -940,6 +977,49 @@ mod tests {
                 .map(|f| (f.name.as_str(), f.size))
                 .collect::<Vec<_>>(),
             vec![("STREET", 20), ("CITY", 10), ("ZIP", 5)]
+        );
+    }
+
+    #[test]
+    fn occurs_expansion_is_bounded_before_it_allocates() {
+        use std::fmt::Write as _;
+
+        // Two thousand lines of OCCURS 4096 is a 60 KB copybook describing
+        // over eight million one-byte fields. It used to be accepted.
+        let mut source = String::from("01 REC.\n");
+        for index in 0..2000 {
+            writeln!(source, "05 A{index} PIC X OCCURS 4096.").unwrap();
+        }
+        let started = std::time::Instant::now();
+        let err = compile(&source).unwrap_err();
+        assert!(
+            matches!(&err, ParseError::Unsupported(m) if m.contains("fields")),
+            "got {err:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "refused only after {:?}",
+            started.elapsed()
+        );
+
+        // Wide occurrences hit the record byte limit the same way.
+        let source = "01 REC.\n05 A PIC X(4096) OCCURS 4096.\n05 B PIC X(4096) OCCURS 4096.\n";
+        let err = compile(source).unwrap_err();
+        assert!(
+            matches!(&err, ParseError::Unsupported(m) if m.contains("bytes")),
+            "got {err:?}"
+        );
+
+        // Level-88 conditions are copied onto every occurrence, so their
+        // copies are bounded as well.
+        let mut source = String::from("01 REC.\n05 A PIC X OCCURS 4096.\n");
+        for index in 0..100 {
+            writeln!(source, "88 C{index} VALUE 'X'.").unwrap();
+        }
+        let err = compile(&source).unwrap_err();
+        assert!(
+            matches!(&err, ParseError::Unsupported(m) if m.contains("level-88")),
+            "got {err:?}"
         );
     }
 
