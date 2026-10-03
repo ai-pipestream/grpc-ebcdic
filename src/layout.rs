@@ -583,6 +583,40 @@ fn check_width(field: &RawField, context: &str) -> Result<(), ParseError> {
     Ok(())
 }
 
+/// Most digits a binary field can hold: `u128::MAX` has thirty-nine.
+const MAX_BINARY_DIGITS: u32 = 39;
+
+/// Check that a field's implied decimal digits are ones it can actually hold.
+///
+/// The scale is how many zeros a rendered value may be padded with, so an
+/// unchecked one lets a one-byte field allocate gigabytes per cell. No field
+/// can carry more fractional digits than it has digits at all: a packed field
+/// holds two per byte less the sign nibble, a zoned field one per byte, and a
+/// binary field at most [`MAX_BINARY_DIGITS`].
+fn check_scale(field: &RawField, context: &str) -> Result<(), ParseError> {
+    if field.scale == 0 {
+        return Ok(());
+    }
+    if !field.kind.is_numeric() {
+        return Err(ParseError::invalid(format!(
+            "{context} field {:?} has scale {} but is not a numeric field",
+            field.name, field.scale
+        )));
+    }
+    let digits = match field.kind {
+        FieldKind::PackedDecimal => field.size.saturating_mul(2).saturating_sub(1),
+        FieldKind::ZonedDecimal => field.size,
+        _ => MAX_BINARY_DIGITS,
+    };
+    if field.scale > digits {
+        return Err(ParseError::invalid(format!(
+            "{context} field {:?} has scale {} but holds at most {digits} digits",
+            field.name, field.scale
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a prefix field: it is read ahead of every record, so it has to be
 /// something a length or a selector can be made of.
 fn prefix_field(raw: RawField, role: &str) -> Result<Field, ParseError> {
@@ -597,6 +631,7 @@ fn prefix_field(raw: RawField, role: &str) -> Result<Field, ParseError> {
         )));
     }
     check_width(&raw, role)?;
+    check_scale(&raw, role)?;
     let name = if raw.name.is_empty() {
         role.to_string()
     } else {
@@ -741,12 +776,7 @@ fn validate(raw: RawLayout, source: pb::LayoutSource) -> Result<Layout, ParseErr
                     "a field of record {name:?} has no name; only fillers may be anonymous"
                 )));
             }
-            if raw_field.scale != 0 && !raw_field.kind.is_numeric() {
-                return Err(ParseError::invalid(format!(
-                    "field {:?} of record {name:?} has scale {} but is not a numeric field",
-                    raw_field.name, raw_field.scale
-                )));
-            }
+            check_scale(&raw_field, &format!("record {name:?}"))?;
             // A flat layout form declares no path, so the field name is the
             // whole of it: a consumer reads `path` without asking which form
             // the layout arrived in.
@@ -978,6 +1008,50 @@ mod tests {
         });
         let err = resolve(&options(layout)).unwrap_err();
         assert!(matches!(err, ParseError::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_scale_past_the_digits_a_field_holds_is_invalid_argument() {
+        // Each rendered cell is padded to `scale` digits, so an unbounded
+        // scale is an allocation per cell of whatever the caller asked for.
+        for (kind, size, most) in [
+            (pb::FieldType::PackedDecimal, 5, 9),
+            (pb::FieldType::ZonedDecimal, 5, 5),
+            (pb::FieldType::Integer, 4, 39),
+        ] {
+            let mut layout = sample_layout();
+            layout.records[0].fields[1].r#type = kind as i32;
+            layout.records[0].fields[1].size = size;
+            layout.records[0].fields[1].scale = most;
+            resolve(&options(layout.clone())).expect("a scale the field can hold");
+            layout.records[0].fields[1].scale = most + 1;
+            let err = resolve(&options(layout)).unwrap_err();
+            assert!(
+                matches!(&err, ParseError::Invalid(m) if m.contains("BALANCE")),
+                "{kind:?}: got {err:?}"
+            );
+        }
+
+        // The JSON form, and the prefix fields, are held to the same bound.
+        let json = br#"{"records":[{"fields":[
+            {"name":"N","size":1,"type":"packed_decimal","scale":4000000000}]}]}"#;
+        let err = resolve(&pb::ParseOptions {
+            layout_source: Some(pb::parse_options::LayoutSource::LayoutJson(json.to_vec())),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(matches!(err, ParseError::Invalid(_)), "got {err:?}");
+        let mut layout = sample_layout();
+        layout.record_type_field = Some(pb::EbcdicField {
+            name: "KIND".into(),
+            size: 1,
+            r#type: pb::FieldType::PackedDecimal as i32,
+            scale: 200_000_000,
+            ..Default::default()
+        });
+        layout.records[0].selector = Some("1".into());
+        let err = resolve(&options(layout)).unwrap_err();
+        assert!(matches!(err, ParseError::Invalid(_)), "got {err:?}");
     }
 
     #[test]
