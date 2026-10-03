@@ -603,7 +603,9 @@ const MAX_BINARY_DIGITS: u32 = 39;
 /// holds two per byte less the sign nibble, a zoned field one per byte, and a
 /// binary field at most [`MAX_BINARY_DIGITS`].
 fn check_scale(field: &RawField, context: &str) -> Result<(), ParseError> {
-    if field.scale == 0 {
+    // A filler keeps its picture's scale but is never rendered, so the scale
+    // allocates nothing; `05 FILLER PIC S9(3)V99 COMP-3` is ordinary.
+    if field.scale == 0 || field.kind == FieldKind::Skip {
         return Ok(());
     }
     if !field.kind.is_numeric() {
@@ -1025,6 +1027,19 @@ mod tests {
         });
         let err = resolve(&options(layout)).unwrap_err();
         assert!(matches!(err, ParseError::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_filler_with_an_implied_decimal_still_resolves() {
+        // FILLER keeps its picture's scale but is skipped, never rendered.
+        let copybook = "       01 REC.\n\
+                        \x20          05 A PIC X.\n\
+                        \x20          05 FILLER PIC S9(3)V99 COMP-3.\n";
+        resolve(&pb::ParseOptions {
+            layout_source: Some(pb::parse_options::LayoutSource::Copybook(copybook.into())),
+            ..Default::default()
+        })
+        .expect("a scaled filler is an ordinary copybook");
     }
 
     #[test]
