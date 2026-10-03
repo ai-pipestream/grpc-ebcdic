@@ -37,8 +37,9 @@ pub const DEFAULT_MAX_DOCUMENT_MIB: u32 = 512;
 
 /// Default number of parse streams admitted at once.
 ///
-/// Each in-flight parse holds at most one record plus a footer, so the bound
-/// is about fairness and file descriptors rather than heap. Past it a call is
+/// Each in-flight parse holds at most one inbound frame plus a partial record
+/// and a footer, so the bound is about fairness and file descriptors more
+/// than heap. Past it a call is
 /// refused rather than queued: a queued parse that eventually runs is worse for
 /// a live view than one that fails fast.
 pub const DEFAULT_MAX_CONCURRENT_PARSES: usize = 64;
