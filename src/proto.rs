@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Generated protobuf code for the `ai.pipestream.ebcdic.v1` and
-//! `ai.pipestream.document.v1` packages.
+//! `ai.pipestream.document.v1` packages, and the
+//! `org.apache.opennlp.grpc.v1` package `document.proto` imports.
 //!
 //! Produced at build time by `build.rs` (tonic-prost-build) from the contracts
 //! under `proto/`, which `buf` lints and breaking-checks. Nothing here is
@@ -23,7 +24,13 @@ mod generated {
             pub mod document {
                 /// Messages and enums of the `ai.pipestream.document.v1`
                 /// package, vendored from gRParse.
-                #[allow(clippy::all, clippy::pedantic, clippy::nursery, missing_docs)]
+                #[allow(
+                    clippy::all,
+                    clippy::pedantic,
+                    clippy::nursery,
+                    missing_docs,
+                    rustdoc::all
+                )]
                 pub mod v1 {
                     tonic::include_proto!("ai.pipestream.document.v1");
                 }
@@ -36,6 +43,32 @@ mod generated {
                 #[allow(clippy::all, clippy::pedantic, clippy::nursery, missing_docs)]
                 pub mod v1 {
                     tonic::include_proto!("ai.pipestream.ebcdic.v1");
+                }
+            }
+        }
+    }
+
+    /// The `org` protobuf namespace.
+    pub mod org {
+        /// The `org.apache` protobuf namespace.
+        pub mod apache {
+            /// The `org.apache.opennlp` protobuf namespace.
+            pub mod opennlp {
+                /// The `org.apache.opennlp.grpc` protobuf namespace.
+                pub mod grpc {
+                    /// Messages and enums of the `org.apache.opennlp.grpc.v1`
+                    /// package, vendored from gRParse: the OpenNLP analyses
+                    /// `Document.analyses` carries. This crate never fills them.
+                    #[allow(
+                        clippy::all,
+                        clippy::pedantic,
+                        clippy::nursery,
+                        missing_docs,
+                        rustdoc::all
+                    )]
+                    pub mod v1 {
+                        tonic::include_proto!("org.apache.opennlp.grpc.v1");
+                    }
                 }
             }
         }

@@ -19,6 +19,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Document projection is optional on the wire but the schema is not
         // optional at build time: the response oneof references it.
         "proto/ai/pipestream/document/v1/document.proto",
+        // Vendored byte-identical from the gRParse repo beside document.proto,
+        // which imports them for `Document.analyses`.
+        "proto/org/apache/opennlp/grpc/v1/opennlp_document.proto",
+        "proto/org/apache/opennlp/grpc/v1/opennlp_annotations.proto",
         "proto/ai/pipestream/ebcdic/v1/ebcdic.proto",
         "proto/ai/pipestream/ebcdic/v1/ebcdic_service.proto",
     ];
