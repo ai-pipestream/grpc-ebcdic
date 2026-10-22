@@ -10,6 +10,8 @@
 //! opaque expectation". Nothing touches the network beyond localhost and
 //! nothing touches the disk at all.
 
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio_stream::wrappers::TcpListenerStream;
@@ -455,6 +457,77 @@ async fn rows_arrive_before_the_input_is_finished() {
         panic!("expected the trailer, got {trailer:?}");
     };
     assert_eq!(status.records_kept, 2);
+}
+
+/// Many small rows reach a client that sends its whole upload before it
+/// reads any of them.
+///
+/// Each record here decodes to a row of a few dozen bytes, and each chunk
+/// completes one record, so the server has one small event per frame it reads.
+/// h2 charges every DATA frame under 256 bytes against a per-connection budget
+/// that refills only as the application reads, and closes the connection with
+/// GOAWAY `too_many_data_frames` when it runs out, so a server that wrote one
+/// frame per row would cut this client off a hundred or so rows in. Every row
+/// has to arrive, in order, followed by the trailer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn many_small_rows_reach_a_client_that_uploads_before_it_reads() {
+    const RECORDS: u32 = 600;
+    let metrics = Metrics::new();
+    let client = start_server_with(EbcdicGrpc::new(Arc::clone(&metrics))).await;
+    let options = pb::ParseOptions {
+        layout_source: Some(pb::parse_options::LayoutSource::Copybook(
+            "01 R.\n05 V PIC 9(4).\n".into(),
+        )),
+        ..Default::default()
+    };
+    let records: Vec<Vec<u8>> = (0..RECORDS)
+        .map(|n| Encoder::new("cp037").zoned(i64::from(n), 4).build())
+        .collect();
+    let total: usize = records.iter().map(Vec::len).sum();
+    let mut frames = vec![options_frame(options)];
+    frames.extend(records.iter().map(|record| chunk_frame(record)));
+
+    let mut client = client.clone();
+    let mut stream = client
+        .parse_ebcdic(tokio_stream::iter(frames))
+        .await
+        .expect("open the call")
+        .into_inner();
+    // Nothing is read until the server has the whole upload, or has given up
+    // on it, in which case the reads below report why.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while metrics.bytes_received.load(Ordering::Relaxed) < total as u64
+            && metrics.parses_failed.load(Ordering::Relaxed) == 0
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the server takes the whole upload");
+
+    let mut events = Vec::new();
+    while let Some(event) = stream.message().await.expect("stream is healthy") {
+        events.push(event.event.expect("every event carries a payload"));
+    }
+    assert_eq!(events.len(), RECORDS as usize + 2);
+    assert!(matches!(
+        events[0],
+        pb::parse_ebcdic_response::Event::LayoutInfo(_)
+    ));
+    for (n, event) in (0..RECORDS).zip(&events[1..=RECORDS as usize]) {
+        let pb::parse_ebcdic_response::Event::Record(row) = event else {
+            panic!("event {} should be row {n}, got {event:?}", n + 1);
+        };
+        assert_eq!(row.record_index, u64::from(n));
+        assert_eq!(cell(row, "V"), &pb::cell::Value::Integer(i64::from(n)));
+    }
+    let Some(pb::parse_ebcdic_response::Event::Status(status)) = events.last() else {
+        panic!(
+            "the last event must be the trailer, got {:?}",
+            events.last()
+        );
+    };
+    assert_eq!(status.records_kept, u64::from(RECORDS));
 }
 
 /// Half a record is not a record: the row appears only when its last byte does.

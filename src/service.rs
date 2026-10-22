@@ -12,11 +12,16 @@
 //! — that is what a Document is — and is therefore off by default and capped
 //! when on. See [`crate::document_fold`].
 
+use std::collections::VecDeque;
+use std::future::Future as _;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
+use prost::Message as _;
 use tokio::sync::{Semaphore, mpsc};
+use tokio::time::Sleep;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -244,10 +249,9 @@ impl EbcdicParseService for EbcdicGrpc {
             }
         });
 
-        Ok(Response::new(Box::pin(TrailerGuard {
-            events: ReceiverStream::new(rx),
-            finished: false,
-        }) as EventStream))
+        Ok(Response::new(
+            Box::pin(TrailerGuard::new(ReceiverStream::new(rx))) as EventStream,
+        ))
     }
 
     async fn get_service_info(
@@ -340,49 +344,121 @@ impl EventSink<'_> {
     }
 }
 
+/// Encoded event bytes a batch gathers before the transport gets it.
+///
+/// tonic packs the messages that are ready together into one HTTP/2 DATA
+/// frame, and h2 (0.4.18 and later) charges every DATA frame under 256 bytes
+/// against a per-connection budget that refills only as the application reads.
+/// A client that sends its upload before it reads the rows would otherwise get
+/// one small frame per row and close the connection with GOAWAY
+/// `too_many_data_frames` after about a hundred of them.
+const BATCH_BYTES: usize = 256;
+
+/// The longest a small batch waits for more events, so a sparse stream still
+/// reaches the client while the upload continues.
+const BATCH_WAIT: Duration = Duration::from_millis(2);
+
 /// The response stream: the parse's events, then an error if the parse ended
 /// without its trailer.
 ///
 /// The trailer is the contract's last word. When it could not be delivered (an
 /// error the stalled client was not reading for), the channel simply closes,
 /// and passing that through would end the call OK with the rows cut short.
+///
+/// Events go out in batches of at least [`BATCH_BYTES`], after [`BATCH_WAIT`],
+/// or at once when the stream is ending, so the transport writes a few full
+/// DATA frames rather than one per row. A batch stops taking events once it
+/// holds [`BATCH_BYTES`], so it adds at most one event to what the channel
+/// already buffers, and a client that stops reading still stops the parse.
 struct TrailerGuard {
     /// The events the parse task sent.
     events: ReceiverStream<Result<pb::ParseEbcdicResponse, Status>>,
     /// Set once a trailer or an error has gone out.
     finished: bool,
+    /// Events taken from the channel and not yet handed to the transport.
+    batch: VecDeque<Result<pb::ParseEbcdicResponse, Status>>,
+    /// The encoded bytes of the events in `batch`.
+    batch_bytes: usize,
+    /// The batch holds the last event of the stream.
+    batch_final: bool,
+    /// The batch is going out: every event in it is handed over before the
+    /// stream gathers again.
+    releasing: bool,
+    /// Runs while a small batch waits for more events.
+    wait: Option<Pin<Box<Sleep>>>,
+}
+
+impl TrailerGuard {
+    /// Guard the events arriving on `events`.
+    fn new(events: ReceiverStream<Result<pb::ParseEbcdicResponse, Status>>) -> Self {
+        Self {
+            events,
+            finished: false,
+            batch: VecDeque::new(),
+            batch_bytes: 0,
+            batch_final: false,
+            releasing: false,
+            wait: None,
+        }
+    }
 }
 
 impl Stream for TrailerGuard {
     type Item = Result<pb::ParseEbcdicResponse, Status>;
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        if self.finished {
-            return std::task::Poll::Ready(None);
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        if this.finished {
+            return Poll::Ready(None);
         }
-        let polled = Pin::new(&mut self.events).poll_next(cx);
-        match polled {
-            std::task::Poll::Ready(Some(item)) => {
-                self.finished = match &item {
-                    Err(_) => true,
-                    Ok(response) => matches!(
-                        response.event,
-                        Some(pb::parse_ebcdic_response::Event::Status(_))
-                    ),
-                };
-                std::task::Poll::Ready(Some(item))
+        if !this.releasing {
+            while !this.batch_final && this.batch_bytes < BATCH_BYTES {
+                match Pin::new(&mut this.events).poll_next(cx) {
+                    Poll::Pending => break,
+                    Poll::Ready(Some(item)) => {
+                        this.batch_final = match &item {
+                            Err(_) => true,
+                            Ok(response) => matches!(
+                                response.event,
+                                Some(pb::parse_ebcdic_response::Event::Status(_))
+                            ),
+                        };
+                        if let Ok(response) = &item {
+                            this.batch_bytes += response.encoded_len();
+                        }
+                        this.batch.push_back(item);
+                    }
+                    Poll::Ready(None) => {
+                        this.batch_final = true;
+                        this.batch.push_back(Err(Status::internal(
+                            "the parse ended without a ParseStatus trailer",
+                        )));
+                    }
+                }
             }
-            std::task::Poll::Ready(None) => {
-                self.finished = true;
-                std::task::Poll::Ready(Some(Err(Status::internal(
-                    "the parse ended without a ParseStatus trailer",
-                ))))
+            if this.batch.is_empty() {
+                return Poll::Pending;
             }
-            std::task::Poll::Pending => std::task::Poll::Pending,
+            if !this.batch_final && this.batch_bytes < BATCH_BYTES {
+                let wait = this
+                    .wait
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(BATCH_WAIT)));
+                if wait.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+            }
+            this.releasing = true;
+            this.wait = None;
         }
+        let Some(item) = this.batch.pop_front() else {
+            return Poll::Pending;
+        };
+        if this.batch.is_empty() {
+            this.releasing = false;
+            this.batch_bytes = 0;
+            this.finished = this.batch_final;
+        }
+        Poll::Ready(Some(item))
     }
 }
 
