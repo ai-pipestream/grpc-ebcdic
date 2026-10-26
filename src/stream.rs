@@ -580,6 +580,48 @@ mod tests {
     }
 
     #[test]
+    fn a_layout_heavy_with_conditions_decodes_a_record_in_time_proportional_to_its_bytes() {
+        use std::fmt::Write as _;
+
+        // The heaviest condition list the compiler accepts, from a copybook
+        // under one kibibyte: one field repeated 4096 times with 63 values on
+        // it, which is a quarter-million condition values on the record.
+        // Decoding used to clone the whole record layout, conditions and all,
+        // once per record, so each four-kibibyte record cost a quarter-million
+        // string allocations and a stream crawled at a few records a second.
+        let mut source = String::from("01 R.\n05 F PIC X OCCURS 4096.\n88 C VALUE");
+        for value in 0..63 {
+            write!(source, " '{value:02}'").unwrap();
+        }
+        source.push_str(".\n");
+        assert!(source.len() < 1024, "{} bytes", source.len());
+        let layout = layout::resolve(&pb::ParseOptions {
+            layout_source: Some(pb::parse_options::LayoutSource::Copybook(source)),
+            ..Default::default()
+        })
+        .expect("the copybook is within every cap");
+        assert_eq!(layout.records[0].fields.len(), 4096);
+
+        let records = 256usize;
+        let mut stream = RecordStream::new(layout, options());
+        stream.push(&vec![0xc1; 4096 * records]);
+        let started = std::time::Instant::now();
+        let mut rows = 0usize;
+        // Checked inside the loop so a slow decode fails the test early
+        // instead of running for minutes first.
+        while let Some(row) = stream.next_record().expect("no decode failure") {
+            rows += 1;
+            assert_eq!(row.cells.len(), 4096);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "decoding is not proportional to the bytes: {rows} records after {:?}",
+                started.elapsed()
+            );
+        }
+        assert_eq!(rows, records);
+    }
+
+    #[test]
     fn a_trailing_partial_record_warns_and_is_not_an_error() {
         let mut stream = RecordStream::new(simple_layout(), options());
         stream.push(&record("AB", "42"));
