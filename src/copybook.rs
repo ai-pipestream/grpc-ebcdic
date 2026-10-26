@@ -1024,6 +1024,43 @@ mod tests {
     }
 
     #[test]
+    fn condition_literal_bytes_are_bounded_across_occurrences() {
+        // One level-88 literal of two kibibytes under OCCURS 4096: a copybook
+        // of about two kibibytes whose conditions expand to eight mebibytes,
+        // written into the layout event twice over. The value cap counts
+        // values, and a long literal is one value, so this used to compile and
+        // a four-mebibyte copybook reached tens of gigabytes.
+        let source = format!(
+            "01 REC.\n05 A PIC X OCCURS 4096.\n88 C VALUE '{}'.\n",
+            "A".repeat(2048)
+        );
+        let err = compile(&source).unwrap_err();
+        assert!(
+            matches!(&err, ParseError::Unsupported(m) if m.contains("level-88") && m.contains("bytes")),
+            "got {err:?}"
+        );
+
+        // A quarter kibibyte per occurrence is an ordinary table and still
+        // compiles, into a layout event of a few mebibytes.
+        let source = format!(
+            "01 REC.\n05 A PIC X OCCURS 4096.\n88 C VALUE '{}'.\n",
+            "A".repeat(256)
+        );
+        let layout = crate::layout::resolve(&crate::proto::v1::ParseOptions {
+            layout_source: Some(crate::proto::v1::parse_options::LayoutSource::Copybook(
+                source,
+            )),
+            ..Default::default()
+        })
+        .expect("a kibibyte of conditions per occurrence is ordinary");
+        let encoded = prost::Message::encoded_len(&layout.to_layout_info("cp037"));
+        assert!(
+            encoded <= 16 * 1024 * 1024,
+            "the layout event is {encoded} bytes"
+        );
+    }
+
+    #[test]
     fn occurs_expands_to_indexed_names() {
         let record = &compile("01 REC.\n05 MONTH-TOTAL PIC S9(5) COMP-3 OCCURS 3 TIMES.\n")
             .unwrap()
