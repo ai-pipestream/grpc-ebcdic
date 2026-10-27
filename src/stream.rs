@@ -188,22 +188,27 @@ impl RecordStream {
             return Ok(None);
         }
 
-        let (record, body_size) = self.read_prefix()?;
+        let (record_index, body_size) = self.read_prefix()?;
         let total = prefix_size + body_size;
         if self.available() < total {
             return Ok(None);
         }
 
         let byte_offset = self.buffer_base;
+        // Borrowed, not cloned: a layout at the field cap with its conditions
+        // is megabytes, and copying it once per record made the cost of a
+        // record proportional to the layout instead of to its bytes.
+        let record = &self.layout.records[record_index];
         let body = &self.pending()[prefix_size..total];
-        let cells = decode_cells(&record, body, &self.options)?;
+        let cells = decode_cells(record, body, &self.options)?;
+        let record_type = record.name.clone();
         let row_index = self
             .rows_per_type
-            .get(&record.name)
+            .get(&record_type)
             .copied()
             .unwrap_or_default();
         let row = pb::RecordRow {
-            record_type: record.name.clone(),
+            record_type: record_type.clone(),
             row_index,
             record_index: self.records_kept,
             byte_offset,
@@ -215,7 +220,7 @@ impl RecordStream {
         };
         self.consume(total);
         self.records_kept += 1;
-        *self.rows_per_type.entry(record.name).or_default() += 1;
+        *self.rows_per_type.entry(record_type).or_default() += 1;
         if self.options.max_records != 0 && self.records_kept >= self.options.max_records {
             self.truncated = true;
             self.buffer_base = self.received;
@@ -225,11 +230,12 @@ impl RecordStream {
         Ok(Some(row))
     }
 
-    /// Read the record prefix and resolve the schema plus the body length.
+    /// Read the record prefix and resolve the schema, as its position in the
+    /// layout, plus the body length.
     ///
     /// Does not consume: the caller may still be short of the body, in which
     /// case the prefix has to be re-read after the next chunk.
-    fn read_prefix(&self) -> Result<(RecordLayout, usize), ParseError> {
+    fn read_prefix(&self) -> Result<(usize, usize), ParseError> {
         let mut cursor = 0usize;
         let mut declared_length: Option<i128> = None;
         if let Some(field) = self.layout.record_length_field.as_ref() {
@@ -252,13 +258,14 @@ impl RecordStream {
             record_type = Some(decode_field(field, bytes, &self.options)?.to_display_string());
         }
 
-        let Some(record) = self.layout.select(record_type.as_deref()) else {
+        let Some(record_index) = self.layout.select_index(record_type.as_deref()) else {
             return Err(ParseError::invalid(format!(
                 "no record schema has selector {:?} (record at byte {})",
                 record_type.unwrap_or_default(),
                 self.buffer_base
             )));
         };
+        let record = &self.layout.records[record_index];
 
         let body_size = match declared_length {
             None => i128::from(record.size),
@@ -286,7 +293,7 @@ impl RecordStream {
                 crate::layout::MAX_RECORD_BYTES
             )));
         }
-        Ok((record.clone(), body_size))
+        Ok((record_index, body_size))
     }
 
     /// Build the trailer once the input is over and no record is left.
