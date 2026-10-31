@@ -824,6 +824,9 @@ fn cell_value(cell: &pb::Cell) -> Option<doc::CellValue> {
     Some(doc::CellValue {
         kind: Some(doc::cell_value::Kind::Number(number)),
         number_format: None,
+        formula_source: None,
+        number_format_id: None,
+        style_id: None,
     })
 }
 
