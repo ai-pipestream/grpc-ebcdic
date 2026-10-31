@@ -331,16 +331,13 @@ impl EventSink<'_> {
     /// goes out immediately before the trailer, and the trailer stays last.
     async fn finish(&mut self, mut status: pb::ParseStatus) -> Result<(), ParseError> {
         let Some(mut fold) = self.fold.take() else {
-            return self
-                .send(pb::parse_ebcdic_response::Event::Status(status))
-                .await;
+            return Box::pin(self.send(pb::parse_ebcdic_response::Event::Status(status))).await;
         };
         status.warnings.extend(fold.truncation_warnings());
         let status = pb::parse_ebcdic_response::Event::Status(status);
         fold.consume(&status);
-        self.send(pb::parse_ebcdic_response::Event::Document(fold.take()))
-            .await?;
-        self.send(status).await
+        Box::pin(self.send(pb::parse_ebcdic_response::Event::Document(fold.take()))).await?;
+        Box::pin(self.send(status)).await
     }
 }
 
@@ -505,8 +502,7 @@ async fn run_parse(
     mut sink: EventSink<'_>,
     metrics: &Metrics,
 ) -> Result<(), ParseError> {
-    sink.send(pb::parse_ebcdic_response::Event::LayoutInfo(layout_info))
-        .await?;
+    Box::pin(sink.send(pb::parse_ebcdic_response::Event::LayoutInfo(layout_info))).await?;
 
     loop {
         let frame = match next_frame(inbound, limits.idle_timeout).await {
@@ -537,11 +533,11 @@ async fn run_parse(
         }
         Metrics::add(&metrics.bytes_received, chunk.len() as u64);
         walk.push(&chunk);
-        drain(&mut walk, &mut sink, metrics).await?;
+        Box::pin(drain(&mut walk, &mut sink, metrics)).await?;
     }
 
     walk.finish_input();
-    drain(&mut walk, &mut sink, metrics).await?;
+    Box::pin(drain(&mut walk, &mut sink, metrics)).await?;
     let status = walk.status()?;
     // Boxed: the trailer future holds the status and document messages across
     // two sends, which makes it too large to inline into this frame.
@@ -556,8 +552,7 @@ async fn drain(
 ) -> Result<(), ParseError> {
     while let Some(row) = walk.next_record()? {
         Metrics::bump(&metrics.records_emitted);
-        sink.send(pb::parse_ebcdic_response::Event::Record(row))
-            .await?;
+        Box::pin(sink.send(pb::parse_ebcdic_response::Event::Record(row))).await?;
     }
     Ok(())
 }
