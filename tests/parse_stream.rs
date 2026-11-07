@@ -35,6 +35,12 @@ async fn start_server() -> Client {
 
 /// Start a specific service configuration and return a client for it.
 async fn start_server_with(service: EbcdicGrpc) -> Client {
+    let endpoint = start_server_endpoint(service).await;
+    EbcdicParseServiceClient::new(endpoint.connect().await.expect("connect"))
+}
+
+/// Return an endpoint so tests can connect independent clients to one server.
+async fn start_server_endpoint(service: EbcdicGrpc) -> Endpoint {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -47,12 +53,7 @@ async fn start_server_with(service: EbcdicGrpc) -> Client {
             .expect("server runs");
     });
     // The listener is bound before the spawn, so connecting cannot race it.
-    let channel = Endpoint::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .expect("connect");
-    EbcdicParseServiceClient::new(channel)
+    Endpoint::from_shared(format!("http://{addr}")).unwrap()
 }
 
 /// Builds EBCDIC record bytes from readable values.
@@ -874,12 +875,19 @@ async fn an_idle_stream_gives_its_parse_slot_back() {
 
 #[tokio::test]
 async fn a_client_that_stops_reading_gives_its_parse_slot_back() {
-    let client = start_server_with(
-        EbcdicGrpc::new(Metrics::new())
+    let metrics = Metrics::new();
+    let endpoint = start_server_endpoint(
+        EbcdicGrpc::new(Arc::clone(&metrics))
             .with_max_concurrent_parses(1)
             .with_idle_timeout(Duration::from_secs(1)),
     )
     .await;
+    let client = Client::new(endpoint.connect().await.expect("probe connects"));
+    // Cloning a tonic client shares its HTTP/2 connection. A stalled upload
+    // can exhaust that connection's receive window, starving the probe's
+    // options frame even after the parse permit is released. This test checks
+    // the global parse slot across clients, so give each its own connection.
+    let mut stalled = Client::new(endpoint.connect().await.expect("stalled client connects"));
     // A full second, not the idle test's 200 ms: the probe parses below run
     // while the stalled one is decoding, and must not trip the bound themselves.
 
@@ -894,7 +902,6 @@ async fn a_client_that_stops_reading_gives_its_parse_slot_back() {
         .collect();
     let mut frames = vec![options_frame(customer_options())];
     frames.extend(data.chunks(64 * 1024).map(chunk_frame));
-    let mut stalled = client.clone();
     let mut stream = stalled
         .parse_ebcdic(tokio_stream::iter(frames))
         .await
@@ -910,12 +917,19 @@ async fn a_client_that_stops_reading_gives_its_parse_slot_back() {
                 break;
             }
             Err(status) if attempt < 100 => {
-                assert_eq!(status.code(), Code::ResourceExhausted);
+                assert_eq!(
+                    status.code(),
+                    Code::ResourceExhausted,
+                    "probe {attempt}: {status}"
+                );
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Err(status) => panic!("the stalled reader kept the slot: {status}"),
         }
     }
+
+    assert_eq!(metrics.parses_failed.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.parses_completed.load(Ordering::Relaxed), 1);
 
     // When it reads again it drains what was queued and then learns the
     // parse ended: never a clean end with the rows cut short.
