@@ -297,12 +297,23 @@ impl Layout {
     /// everything, which is Docling's `EbcdicLayout.select` behaviour.
     #[must_use]
     pub fn select(&self, record_type: Option<&str>) -> Option<&RecordLayout> {
+        self.select_index(record_type)
+            .map(|index| &self.records[index])
+    }
+
+    /// Resolve the position in [`Self::records`] of the schema a record-type
+    /// value selects.
+    ///
+    /// The index rather than the schema, so a walk can name the schema it
+    /// chose without borrowing or copying it while it still reads the input.
+    #[must_use]
+    pub fn select_index(&self, record_type: Option<&str>) -> Option<usize> {
         match (self.record_type_field.as_ref(), record_type) {
-            (None, _) => self.records.first(),
+            (None, _) => (!self.records.is_empty()).then_some(0),
             (Some(_), value) => self
                 .records
                 .iter()
-                .find(|record| record.selector.as_deref() == value),
+                .position(|record| record.selector.as_deref() == value),
         }
     }
 

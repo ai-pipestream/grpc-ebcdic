@@ -57,6 +57,16 @@ const MAX_OCCURS: u32 = 4096;
 /// this bounds the copies rather than the source.
 const MAX_CONDITION_VALUES: u64 = 262_144;
 
+/// Most bytes of level-88 names and literals the expanded record may carry in
+/// total.
+///
+/// The value cap bounds how many copies an `OCCURS` makes; this bounds what
+/// each copy weighs, because one long literal is one value. The literals are
+/// written into the layout event twice over (flat and as ranges) and again
+/// into a folded Document, so a copybook the size of a gRPC frame would
+/// otherwise expand to gigabytes.
+const MAX_CONDITION_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Compile copybook source into the raw layout shape.
 ///
 /// # Errors
@@ -592,7 +602,7 @@ fn flatten(items: &[Item], out: &mut Vec<RawField>) -> Result<(), ParseError> {
     // whole record, so a copybook of OCCURS items cannot allocate millions of
     // fields before validation gets to see their sum.
     let mut record_bytes: u64 = 0;
-    let mut condition_values: u64 = 0;
+    let mut conditions = ConditionWeight::default();
     for (index, item) in items.iter().enumerate() {
         groups.retain(|(level, _)| *level < item.level);
         let label = item.name.clone().unwrap_or_else(|| "FILLER".to_string());
@@ -663,18 +673,7 @@ fn flatten(items: &[Item], out: &mut Vec<RawField>) -> Result<(), ParseError> {
                  build accepts at most {MAX_LAYOUT_FIELDS}"
             )));
         }
-        let per_occurrence: u64 = item
-            .conditions
-            .iter()
-            .map(|condition| 1 + condition.values.len() as u64)
-            .sum();
-        condition_values += per_occurrence * u64::from(occurrences);
-        if condition_values > MAX_CONDITION_VALUES {
-            return Err(ParseError::unsupported(format!(
-                "the record's level-88 conditions expand to more than {MAX_CONDITION_VALUES} \
-                 values at {label:?}; this build accepts at most {MAX_CONDITION_VALUES}"
-            )));
-        }
+        conditions.charge(&item.conditions, occurrences, &label)?;
         for occurrence in 1..=occurrences {
             let leaf = match item.name.as_ref() {
                 None => String::new(),
@@ -699,6 +698,59 @@ fn flatten(items: &[Item], out: &mut Vec<RawField>) -> Result<(), ParseError> {
         }
     }
     Ok(())
+}
+
+/// Running weight of the level-88 conditions the expanded record carries, in
+/// values and in bytes, checked before each expansion rather than after it.
+#[derive(Debug, Default)]
+struct ConditionWeight {
+    /// Condition names plus their values so far.
+    values: u64,
+    /// Bytes of condition names and literals so far.
+    bytes: u64,
+}
+
+impl ConditionWeight {
+    /// Add the conditions of one item, copied onto each of its occurrences,
+    /// and refuse once either cap is passed.
+    fn charge(
+        &mut self,
+        conditions: &[ConditionName],
+        occurrences: u32,
+        label: &str,
+    ) -> Result<(), ParseError> {
+        let values: u64 = conditions
+            .iter()
+            .map(|condition| 1 + condition.values.len() as u64)
+            .sum();
+        let bytes: u64 = conditions
+            .iter()
+            .map(|condition| {
+                let literals: usize = condition
+                    .values
+                    .iter()
+                    .map(|value| value.low.len() + value.high.as_ref().map_or(0, String::len))
+                    .sum();
+                (condition.name.len() + literals) as u64
+            })
+            .sum();
+        self.values += values * u64::from(occurrences);
+        self.bytes += bytes * u64::from(occurrences);
+        if self.values > MAX_CONDITION_VALUES {
+            return Err(ParseError::unsupported(format!(
+                "the record's level-88 conditions expand to more than {MAX_CONDITION_VALUES} \
+                 values at {label:?}; this build accepts at most {MAX_CONDITION_VALUES}"
+            )));
+        }
+        if self.bytes > MAX_CONDITION_BYTES {
+            return Err(ParseError::unsupported(format!(
+                "the record's level-88 conditions expand to more than {MAX_CONDITION_BYTES} \
+                 bytes of names and literals at {label:?}; this build accepts at most \
+                 {MAX_CONDITION_BYTES}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// What a picture clause and a usage together say about the bytes.
@@ -1020,6 +1072,43 @@ mod tests {
         assert!(
             matches!(&err, ParseError::Unsupported(m) if m.contains("level-88")),
             "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn condition_literal_bytes_are_bounded_across_occurrences() {
+        // One level-88 literal of two kibibytes under OCCURS 4096: a copybook
+        // of about two kibibytes whose conditions expand to eight mebibytes,
+        // written into the layout event twice over. The value cap counts
+        // values, and a long literal is one value, so this used to compile and
+        // a four-mebibyte copybook reached tens of gigabytes.
+        let source = format!(
+            "01 REC.\n05 A PIC X OCCURS 4096.\n88 C VALUE '{}'.\n",
+            "A".repeat(2048)
+        );
+        let err = compile(&source).unwrap_err();
+        assert!(
+            matches!(&err, ParseError::Unsupported(m) if m.contains("level-88") && m.contains("bytes")),
+            "got {err:?}"
+        );
+
+        // A quarter kibibyte per occurrence is an ordinary table and still
+        // compiles, into a layout event of a few mebibytes.
+        let source = format!(
+            "01 REC.\n05 A PIC X OCCURS 4096.\n88 C VALUE '{}'.\n",
+            "A".repeat(256)
+        );
+        let layout = crate::layout::resolve(&crate::proto::v1::ParseOptions {
+            layout_source: Some(crate::proto::v1::parse_options::LayoutSource::Copybook(
+                source,
+            )),
+            ..Default::default()
+        })
+        .expect("a kibibyte of conditions per occurrence is ordinary");
+        let encoded = prost::Message::encoded_len(&layout.to_layout_info("cp037"));
+        assert!(
+            encoded <= 16 * 1024 * 1024,
+            "the layout event is {encoded} bytes"
         );
     }
 
