@@ -41,8 +41,9 @@ consumed, or per-item events before Complete).
 ## Workspace
 
 Checkout path: `/work/main/grpc-services/grpc-ebcdic`.
-Git: `origin` = Forgejo (push `main` here). `github` = GitHub mirror.
-Never merge GitHub `main`. See `docs/guidelines.md`.
+Git: `origin` = Forgejo, `github` = GitHub. Open and merge PRs on either;
+a fast-forward-only sync job copies commits across. Never force-push. See
+`docs/guidelines.md`.
 
 gRParse wiring (`COLLECTOR_*` enum, endpoint env) is a **follow-up**. Ship a
 working server in this repo first.
