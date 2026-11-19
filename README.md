@@ -546,10 +546,11 @@ describes.
 
 ## Remotes
 
-- **Forgejo** (`git.rokkon.com/ai-pipestream/grpc-ebcdic`) is the source of
-  truth. `main` lives here.
-- **GitHub** is a public push-mirror. Forgejo pushes over SSH with a
-  per-repo write deploy key, and the `forgejo-synced-main` ruleset lets that
-  key bypass the pull-request rule. Do not merge to GitHub `main`.
-
-Push Forgejo first. GitHub `main` updates from the Forgejo push-mirror.
+- **Forgejo** (`git.rokkon.com/ai-pipestream/grpc-ebcdic`) and **GitHub**
+  (`github.com/ai-pipestream/grpc-ebcdic`) both accept work. Merge through a
+  PR on either one.
+- A sync job (`ai-pipestream/devops`, `forge-sync`) copies new commits to the
+  other side by fast-forward only. If both sides gain different commits on the
+  same branch, it pushes nothing and reports a conflict; merge one side into
+  the other and the next run settles it.
+- Neither forge allows force pushes or deleting `main`.
