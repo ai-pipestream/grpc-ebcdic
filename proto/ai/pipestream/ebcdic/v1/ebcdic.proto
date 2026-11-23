@@ -275,6 +275,19 @@ message ConditionName {
   repeated ConditionValue ranges = 3;
 }
 
+// GroupCondition is a level-88 condition name declared under a group item
+// rather than under an elementary field. A group is not a column, so the
+// condition has no FieldSchema to sit on; it is reported here so that nothing
+// the copybook declared is dropped.
+message GroupCondition {
+  // Dotted qualification path of the group item the condition was declared
+  // under, record name first, for example `CUSTOMER-RECORD.ADDRESS`.
+  string group_path = 1;
+
+  // The condition name and the values of the group that make it true.
+  ConditionName condition = 2;
+}
+
 // FieldSchema is one field of a record schema as the server resolved it,
 // including the byte offset it computed.
 message FieldSchema {
@@ -336,6 +349,12 @@ message RecordSchema {
   // Value of the record-type prefix that selects this schema, when the layout
   // has more than one.
   optional string selector = 4;
+
+  // Level-88 condition names the copybook declared under group items, in
+  // declaration order. Conditions under an elementary field are on its
+  // FieldSchema instead. Empty for the protobuf and JSON layout forms, which
+  // have no groups.
+  repeated GroupCondition group_conditions = 5;
 }
 
 // LayoutInfo is the first event of every successful parse, sent before any
@@ -408,6 +427,13 @@ message RecordRow {
   // the schema's `record_length` plus the prefix for fixed-length records, and
   // the decoded length prefix for variable-length ones.
   uint64 byte_length = 6;
+
+  // Bytes of this record's body that lie past the end of its schema and so
+  // were stepped over without being decoded. Only a length-prefixed record
+  // can have any: its prefix may declare more bytes than the schema
+  // describes. Zero when the schema covers the whole body. A layout that is
+  // missing trailing fields shows up here rather than nowhere.
+  uint64 undecoded_bytes = 7;
 }
 
 // WarningCode names a recoverable anomaly the parse survived.
@@ -478,4 +504,12 @@ message ParseStatus {
   // Rows decoded per schema, keyed by schema name. Present for every schema
   // in the layout, including those that matched nothing.
   map<string, uint64> rows_per_record_type = 7;
+
+  // Sum of `RecordRow.undecoded_bytes` over every record kept: bytes inside
+  // length-prefixed records that no schema field covered. Zero when every
+  // schema covered its records exactly.
+  uint64 undecoded_bytes = 8;
+
+  // Number of records kept whose `undecoded_bytes` was not zero.
+  uint64 records_with_undecoded_bytes = 9;
 }

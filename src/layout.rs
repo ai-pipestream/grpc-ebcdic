@@ -199,6 +199,29 @@ pub struct Declaration {
     pub conditions: Vec<ConditionName>,
 }
 
+/// A level-88 condition name declared under a group item.
+///
+/// A group is not a column, so the condition has no field to sit on; it is
+/// kept beside the fields so the schema still reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupCondition {
+    /// Dotted qualification path of the group item, record name first.
+    pub path: String,
+    /// The condition name and its values.
+    pub condition: ConditionName,
+}
+
+impl GroupCondition {
+    /// The protobuf view of this condition.
+    #[must_use]
+    pub fn to_proto(&self) -> pb::GroupCondition {
+        pb::GroupCondition {
+            group_path: self.path.clone(),
+            condition: Some(self.condition.to_proto()),
+        }
+    }
+}
+
 /// One fixed-width field, with its offset already resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
@@ -254,6 +277,8 @@ pub struct RecordLayout {
     pub size: u32,
     /// Record-type prefix value that selects this schema.
     pub selector: Option<String>,
+    /// Level-88 condition names declared under group items, in source order.
+    pub group_conditions: Vec<GroupCondition>,
 }
 
 impl RecordLayout {
@@ -265,6 +290,11 @@ impl RecordLayout {
             record_length: self.size,
             fields: self.fields.iter().map(Field::to_schema).collect(),
             selector: self.selector.clone(),
+            group_conditions: self
+                .group_conditions
+                .iter()
+                .map(GroupCondition::to_proto)
+                .collect(),
         }
     }
 }
@@ -364,6 +394,9 @@ pub(crate) struct RawRecord {
     pub(crate) fields: Vec<RawField>,
     /// Record-type selector.
     pub(crate) selector: Option<String>,
+    /// Level-88 condition names declared under group items. Only a copybook
+    /// has groups, so the flat forms leave this empty.
+    pub(crate) group_conditions: Vec<GroupCondition>,
 }
 
 /// A whole layout as it arrives.
@@ -444,6 +477,7 @@ fn from_proto(layout: &pb::EbcdicLayout) -> Result<RawLayout, ParseError> {
                     name: record.name.clone(),
                     fields: record.fields.iter().map(field).collect::<Result<_, _>>()?,
                     selector: record.selector.clone(),
+                    group_conditions: Vec::new(),
                 })
             })
             .collect::<Result<_, ParseError>>()?,
@@ -489,9 +523,12 @@ impl From<JsonFieldType> for FieldKind {
 
 /// Docling's `EbcdicField`, as it appears in a serialized layout.
 ///
-/// Unknown keys are ignored rather than rejected, matching pydantic's default,
-/// so a layout written for a newer Docling still loads here.
+/// Unknown keys are rejected. Every key here but `name` and `size` has a
+/// default, so a misspelled `scael` or `typ` would otherwise load as scale 0
+/// or character data, and every amount would come back a hundred times too
+/// large or as text with nothing to say why.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct JsonField {
     /// Column name.
     name: String,
@@ -528,8 +565,9 @@ impl From<JsonField> for RawField {
     }
 }
 
-/// Docling's `EbcdicRecordLayout`.
+/// Docling's `EbcdicRecordLayout`. Unknown keys are rejected, as for a field.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct JsonRecord {
     /// Fields in physical record order.
     fields: Vec<JsonField>,
@@ -541,8 +579,9 @@ struct JsonRecord {
     selector: Option<String>,
 }
 
-/// Docling's `EbcdicLayout`.
+/// Docling's `EbcdicLayout`. Unknown keys are rejected, as for a field.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct JsonLayout {
     /// Record schemas.
     records: Vec<JsonRecord>,
@@ -576,6 +615,7 @@ fn from_json(bytes: &[u8]) -> Result<RawLayout, ParseError> {
                 name: record.name.unwrap_or_default(),
                 fields: record.fields.into_iter().map(RawField::from).collect(),
                 selector: record.selector,
+                group_conditions: Vec::new(),
             })
             .collect(),
         description: parsed.description,
@@ -831,6 +871,7 @@ fn validate(raw: RawLayout, source: pb::LayoutSource) -> Result<Layout, ParseErr
             fields,
             size: cursor,
             selector: raw_record.selector,
+            group_conditions: raw_record.group_conditions,
         });
     }
 
@@ -1155,6 +1196,40 @@ mod tests {
         .unwrap();
         assert_eq!(layout.records[0].name, "record");
         assert_eq!(layout.records[0].fields[0].kind, FieldKind::Text);
+    }
+
+    #[test]
+    fn a_misspelled_json_key_is_invalid_argument_and_is_named() {
+        // Each of these used to load: the key was ignored and its default
+        // applied, so `scael` meant scale 0 and `typ` meant character data.
+        for (json, key) in [
+            (
+                &br#"{"records": [{"fields": [{"name": "F", "size": 5, "type": "packed_decimal", "scael": 2}]}]}"#[..],
+                "scael",
+            ),
+            (
+                br#"{"records": [{"fields": [{"name": "F", "size": 5, "typ": "packed_decimal"}]}]}"#,
+                "typ",
+            ),
+            (
+                br#"{"records": [{"fields": [{"name": "F", "size": 4}], "selectr": "C"}]}"#,
+                "selectr",
+            ),
+            (
+                br#"{"records": [{"fields": [{"name": "F", "size": 4}]}], "header_sise": 80}"#,
+                "header_sise",
+            ),
+        ] {
+            let err = resolve(&pb::ParseOptions {
+                layout_source: Some(pb::parse_options::LayoutSource::LayoutJson(json.to_vec())),
+                ..Default::default()
+            })
+            .unwrap_err();
+            assert!(
+                matches!(&err, ParseError::Invalid(m) if m.contains(key)),
+                "the unknown key {key:?} should be named, got {err:?}"
+            );
+        }
     }
 
     #[test]

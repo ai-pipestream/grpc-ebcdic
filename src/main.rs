@@ -44,20 +44,43 @@ const DEFAULT_ADDR: &str = "0.0.0.0:50063";
 /// Default HTTP/2 initial window, for both the stream and the connection.
 const DEFAULT_WINDOW_BYTES: u32 = 16 * 1024 * 1024;
 
-/// Read a `u64` environment variable, falling back to `default`.
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+/// Read a whole-number environment variable, falling back to `default` only
+/// when it is not set.
+///
+/// A variable that is set to something else fails startup. Falling back
+/// would start the server on a limit the operator did not ask for, with no
+/// line anywhere to say so.
+fn env_setting<T>(name: &str, default: T) -> Result<T, String>
+where
+    T: TryFrom<u64>,
+{
+    match std::env::var(name) {
+        Ok(value) => parse_setting(name, Some(&value), default),
+        Err(std::env::VarError::NotPresent) => parse_setting(name, None, default),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is set but is not text")),
+    }
+}
+
+/// Resolve one setting from its raw value. Unset and empty mean the default;
+/// anything else has to be a whole number that fits the setting's type.
+fn parse_setting<T>(name: &str, value: Option<&str>, default: T) -> Result<T, String>
+where
+    T: TryFrom<u64>,
+{
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(default);
+    };
+    let number: u64 = value
+        .parse()
+        .map_err(|_| format!("{name} is set to {value:?}, which is not a whole number"))?;
+    T::try_from(number).map_err(|_| format!("{name} is set to {value}, which is out of range"))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let workers = usize::try_from(env_u64(
+    let workers = env_setting(
         "GRPC_EBCDIC_WORKERS",
-        std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get) as u64,
-    ))
-    .unwrap_or(4)
+        std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get),
+    )?
     .max(1);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -74,27 +97,25 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .parse()?;
 
     let metrics = Metrics::new();
-    metrics.spawn_reporter(Duration::from_secs(env_u64(
+    metrics.spawn_reporter(Duration::from_secs(env_setting(
         "GRPC_EBCDIC_METRICS_INTERVAL_SECONDS",
-        60,
-    )));
+        60_u64,
+    )?));
 
-    let max_document_mib = u32::try_from(env_u64(
+    let max_document_mib: u32 = env_setting(
         "GRPC_EBCDIC_MAX_DOCUMENT_MIB",
-        u64::from(grpc_ebcdic::service::DEFAULT_MAX_DOCUMENT_MIB),
-    ))
-    .unwrap_or(grpc_ebcdic::service::DEFAULT_MAX_DOCUMENT_MIB);
-    let max_parses = usize::try_from(env_u64(
+        grpc_ebcdic::service::DEFAULT_MAX_DOCUMENT_MIB,
+    )?;
+    let max_parses: usize = env_setting(
         "GRPC_EBCDIC_MAX_CONCURRENT_PARSES",
-        grpc_ebcdic::service::DEFAULT_MAX_CONCURRENT_PARSES as u64,
-    ))
-    .unwrap_or(grpc_ebcdic::service::DEFAULT_MAX_CONCURRENT_PARSES);
+        grpc_ebcdic::service::DEFAULT_MAX_CONCURRENT_PARSES,
+    )?;
 
     let idle_timeout = Duration::from_secs(
-        env_u64(
+        env_setting(
             "GRPC_EBCDIC_IDLE_TIMEOUT_SECONDS",
             grpc_ebcdic::service::DEFAULT_IDLE_TIMEOUT_SECONDS,
-        )
+        )?
         .max(1),
     );
 
@@ -103,11 +124,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .with_max_concurrent_parses(max_parses)
         .with_idle_timeout(idle_timeout);
 
-    let window = u32::try_from(env_u64(
-        "GRPC_EBCDIC_WINDOW_BYTES",
-        u64::from(DEFAULT_WINDOW_BYTES),
-    ))
-    .unwrap_or(DEFAULT_WINDOW_BYTES);
+    let window: u32 = env_setting("GRPC_EBCDIC_WINDOW_BYTES", DEFAULT_WINDOW_BYTES)?;
 
     eprintln!(
         "grpc-ebcdic {} listening on {addr} (cap {max_document_mib} MiB, {max_parses} parses, \
@@ -138,5 +155,33 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {}
         _ = sigterm.recv() => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_setting;
+
+    #[test]
+    fn an_unset_or_empty_setting_takes_the_default() {
+        assert_eq!(parse_setting("X", None, 7_u64), Ok(7));
+        assert_eq!(parse_setting("X", Some(""), 7_u64), Ok(7));
+        assert_eq!(parse_setting("X", Some("  "), 7_u64), Ok(7));
+        assert_eq!(parse_setting("X", Some("12"), 7_u64), Ok(12));
+        assert_eq!(parse_setting("X", Some(" 12 "), 7_u32), Ok(12));
+    }
+
+    #[test]
+    fn a_setting_that_is_set_but_unusable_fails_startup_and_names_itself() {
+        for value in ["512MB", "eight", "-1", "1.5"] {
+            let err = parse_setting("GRPC_EBCDIC_MAX_DOCUMENT_MIB", Some(value), 7_u32)
+                .expect_err("a value that is not a whole number is refused");
+            assert!(err.contains("GRPC_EBCDIC_MAX_DOCUMENT_MIB"), "{err}");
+            assert!(err.contains(value), "{err}");
+        }
+        // Too large for the setting is refused too, not swapped for the default.
+        let err = parse_setting("GRPC_EBCDIC_WINDOW_BYTES", Some("99999999999"), 7_u32)
+            .expect_err("a value past u32 is refused");
+        assert!(err.contains("out of range"), "{err}");
     }
 }
