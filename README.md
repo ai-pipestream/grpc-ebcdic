@@ -124,7 +124,7 @@ Set on the first frame. Exactly one layout form is required.
 |---|---|---|
 | `encoding` | `cp037` | EBCDIC code page for character data |
 | `layout` | one of three required | `EbcdicLayout` protobuf; the canonical form |
-| `layout_json` | one of three required | the same `EbcdicLayout` model as JSON bytes, parsed in process |
+| `layout_json` | one of three required | the same `EbcdicLayout` model as JSON bytes, parsed in process; a key the model does not have is `INVALID_ARGUMENT` |
 | `copybook` | one of three required | COBOL copybook source, compiled in process |
 | `max_records` | `0` (all) | stop after this many records |
 | `strip_control_characters` | `true` | drop Unicode control characters from text |
@@ -443,7 +443,9 @@ request option and never a guess.
 
 ## Environment variables
 
-All optional; see `src/main.rs`.
+All optional; see `src/main.rs`. A numeric variable that is set to something
+other than a whole number in range stops the server at startup, naming the
+variable, instead of falling back to the default.
 
 | Variable | Default | Meaning |
 |---|---|---|

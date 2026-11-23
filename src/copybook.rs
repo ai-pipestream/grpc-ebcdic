@@ -41,8 +41,8 @@
 
 use crate::error::ParseError;
 use crate::layout::{
-    ConditionName, ConditionValue, Declaration, FieldKind, MAX_LAYOUT_FIELDS, MAX_RECORD_BYTES,
-    RawField, RawLayout, RawRecord,
+    ConditionName, ConditionValue, Declaration, FieldKind, GroupCondition, MAX_LAYOUT_FIELDS,
+    MAX_RECORD_BYTES, RawField, RawLayout, RawRecord,
 };
 
 /// Largest `OCCURS` count the compiler will expand.
@@ -89,8 +89,8 @@ pub(crate) fn compile(source: &str) -> Result<RawLayout, ParseError> {
             Parsed::Item(item) => items.push(item),
             // A level-88 entry declares no storage of its own: it names values
             // of the item it follows, which is the item it is attached to
-            // here. One under a group item stays on the group, and the group
-            // is not a column, so it goes no further than this.
+            // here. One under a group item stays on the group, and `flatten`
+            // reports it beside the fields, since a group is not a column.
             Parsed::Condition(condition) => {
                 let Some(item) = items.last_mut() else {
                     return Err(ParseError::invalid(format!(
@@ -136,7 +136,8 @@ pub(crate) fn compile(source: &str) -> Result<RawLayout, ParseError> {
         .clone()
         .unwrap_or_else(|| "record".to_string());
     let mut fields = Vec::new();
-    flatten(&items, &mut fields)?;
+    let mut group_conditions = Vec::new();
+    flatten(&items, &mut fields, &mut group_conditions)?;
     if fields.is_empty() {
         return Err(ParseError::invalid(format!(
             "record {record_name:?} has no elementary fields"
@@ -148,6 +149,7 @@ pub(crate) fn compile(source: &str) -> Result<RawLayout, ParseError> {
             name: record_name,
             fields,
             selector: None,
+            group_conditions,
         }],
         description: String::new(),
         header_size: 0,
@@ -693,12 +695,27 @@ fn usage_in_force(
     Ok(item.usage.or(inherited.map(|(_, usage)| usage)))
 }
 
+/// The dotted path of `leaf` under the open group items, outermost first.
+fn qualified(groups: &[(u8, String, Option<Usage>)], leaf: &str) -> String {
+    let mut path = String::new();
+    for (_, group, _) in groups {
+        path.push_str(group);
+        path.push('.');
+    }
+    path.push_str(leaf);
+    path
+}
+
 /// Walk the level tree and emit the elementary fields in physical order.
 ///
 /// The tree is flattened because the record is flat, but nothing about it is
 /// thrown away: every field keeps its level number and the dotted path of the
 /// group items it sits under, which is how a mainframe consumer names it.
-fn flatten(items: &[Item], out: &mut Vec<RawField>) -> Result<(), ParseError> {
+fn flatten(
+    items: &[Item],
+    out: &mut Vec<RawField>,
+    group_conditions: &mut Vec<GroupCondition>,
+) -> Result<(), ParseError> {
     // The group items currently open, innermost last, as (level, name,
     // usage). A group's usage is the one in force under it: its own, or the
     // one it inherited.
@@ -729,6 +746,17 @@ fn flatten(items: &[Item], out: &mut Vec<RawField>) -> Result<(), ParseError> {
                     item.name.as_deref().unwrap_or("FILLER")
                 )));
             }
+            // A condition name under a group tests the group as a whole. The
+            // group is not a column, so there is no field to carry it; it is
+            // reported with the group's path instead of being dropped.
+            if !item.conditions.is_empty() {
+                conditions.charge(&item.conditions, 1, &label)?;
+                let path = qualified(&groups, &label);
+                group_conditions.extend(item.conditions.iter().map(|condition| GroupCondition {
+                    path: path.clone(),
+                    condition: condition.clone(),
+                }));
+            }
             // Children are emitted by their own iteration; a group contributes
             // no bytes of its own, only a segment of their path.
             groups.push((item.level, label, usage));
@@ -757,13 +785,7 @@ fn flatten(items: &[Item], out: &mut Vec<RawField>) -> Result<(), ParseError> {
             if item.name.is_none() {
                 return String::new();
             }
-            let mut path = String::new();
-            for (_, group, _) in &groups {
-                path.push_str(group);
-                path.push('.');
-            }
-            path.push_str(leaf);
-            path
+            qualified(&groups, leaf)
         };
         // One occurrence per expansion, each with the COBOL subscript that
         // names it and the unsubscripted name of the item it repeats: the
@@ -1065,7 +1087,7 @@ fn describe_numeric(
 mod tests {
     use super::compile;
     use crate::error::ParseError;
-    use crate::layout::{ConditionName, ConditionValue, FieldKind};
+    use crate::layout::{ConditionName, ConditionValue, FieldKind, GroupCondition};
 
     /// The worked example from the README, in fixed-format columns.
     const CUSTOMER: &str = "\
@@ -1429,6 +1451,33 @@ mod tests {
                 .map(|f| f.name.as_str())
                 .collect::<Vec<_>>(),
             ["STATUS-CODE", "REST"]
+        );
+    }
+
+    #[test]
+    fn a_condition_name_under_a_group_item_is_kept_with_the_group_path() {
+        let source = "01 REC.\n\
+                      05 FLAGS.\n\
+                      88 NO-FLAGS VALUE SPACES.\n\
+                      10 A PIC X.\n\
+                      10 B PIC X.\n\
+                      88 B-YES VALUE 'Y'.\n";
+        let record = &compile(source).unwrap().records[0];
+        assert_eq!(
+            record.group_conditions,
+            vec![GroupCondition {
+                path: "REC.FLAGS".to_string(),
+                condition: ConditionName {
+                    name: "NO-FLAGS".to_string(),
+                    values: vec![ConditionValue::literal("SPACES".to_string())],
+                },
+            }]
+        );
+        // The condition under an elementary item still sits on its field.
+        assert_eq!(record.fields[1].declaration.conditions[0].name, "B-YES");
+        assert_eq!(
+            record.fields[0].declaration.conditions,
+            Vec::<ConditionName>::new()
         );
     }
 

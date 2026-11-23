@@ -58,6 +58,10 @@ pub struct RecordStream {
     header_left: u64,
     /// Records emitted so far.
     records_kept: u64,
+    /// Bytes of kept records that lay past the end of their schema.
+    undecoded_bytes: u64,
+    /// Records kept that had any such bytes.
+    records_with_undecoded_bytes: u64,
     /// Rows emitted per schema name.
     rows_per_type: BTreeMap<String, u64>,
     /// Whether `max_records` has been reached.
@@ -85,6 +89,8 @@ impl RecordStream {
             received: 0,
             header_left,
             records_kept: 0,
+            undecoded_bytes: 0,
+            records_with_undecoded_bytes: 0,
             rows_per_type,
             truncated: false,
             input_finished: false,
@@ -201,6 +207,10 @@ impl RecordStream {
         let record = &self.layout.records[record_index];
         let body = &self.pending()[prefix_size..total];
         let cells = decode_cells(record, body, &self.options)?;
+        // A length prefix may declare more bytes than the schema describes.
+        // They are stepped over, and counted, so a layout that is missing
+        // trailing fields does not look like one that covered the record.
+        let undecoded_bytes = (body_size as u64).saturating_sub(u64::from(record.size));
         let record_type = record.name.clone();
         let row_index = self
             .rows_per_type
@@ -217,9 +227,14 @@ impl RecordStream {
             // length-prefixed record the schema alone cannot say.
             byte_length: total as u64,
             cells,
+            undecoded_bytes,
         };
         self.consume(total);
         self.records_kept += 1;
+        if undecoded_bytes > 0 {
+            self.undecoded_bytes += undecoded_bytes;
+            self.records_with_undecoded_bytes += 1;
+        }
         *self.rows_per_type.entry(record_type).or_default() += 1;
         if self.options.max_records != 0 && self.records_kept >= self.options.max_records {
             self.truncated = true;
@@ -358,6 +373,8 @@ impl RecordStream {
                 .iter()
                 .map(|(k, v)| (k.clone(), *v))
                 .collect(),
+            undecoded_bytes: self.undecoded_bytes,
+            records_with_undecoded_bytes: self.records_with_undecoded_bytes,
         })
     }
 }
@@ -931,6 +948,16 @@ mod tests {
             rows.iter().map(|r| r.byte_length).collect::<Vec<_>>(),
             vec![6, 9, 6]
         );
+        // The slack is stepped over, not decoded, and each row says how much
+        // of it there was, so a schema missing trailing fields is visible.
+        assert_eq!(
+            rows.iter().map(|r| r.undecoded_bytes).collect::<Vec<_>>(),
+            vec![0, 3, 0]
+        );
+        stream.finish_input();
+        let status = stream.status().unwrap();
+        assert_eq!(status.undecoded_bytes, 3);
+        assert_eq!(status.records_with_undecoded_bytes, 1);
     }
 
     #[test]
