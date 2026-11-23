@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 
 use crate::codec::Codec;
 use crate::decode::{
-    FieldValue, decode_binary, decode_packed, decode_text, decode_zoned, render_decimal,
+    FieldValue, decode_binary, decode_packed, decode_text, decode_zoned, is_blank, render_decimal,
 };
 use crate::error::ParseError;
 use crate::layout::{Field, FieldKind, Layout, RecordLayout};
@@ -422,6 +422,7 @@ fn decode_cells(
             name: field.name.clone(),
             r#type: field.kind.to_proto() as i32,
             value: Some(to_cell_value(value, field.scale)),
+            blank: field.kind == FieldKind::ZonedDecimal && is_blank(bytes),
         });
     }
     Ok(cells)
@@ -748,6 +749,42 @@ mod tests {
         };
         assert!(message.contains("AMOUNT"), "the field is named: {message}");
         assert!(message.contains("nibble"), "{message}");
+    }
+
+    #[test]
+    fn a_blank_zoned_field_is_flagged_and_text_in_one_fails_the_stream() {
+        let zoned = || {
+            layout::resolve(&pb::ParseOptions {
+                layout_source: Some(pb::parse_options::LayoutSource::Copybook(
+                    "01 R.\n05 NAME PIC X(2).\n05 QTY PIC 9(3).\n".into(),
+                )),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let mut stream = RecordStream::new(zoned(), options());
+        // "AB" then a blank quantity, then "CD" with a written zero.
+        stream.push(&[0xc1, 0xc2, 0x40, 0x40, 0x40]);
+        stream.push(&[0xc3, 0xc4, 0xf0, 0xf0, 0xf0]);
+        let blank = stream.next_record().unwrap().unwrap();
+        let zero = stream.next_record().unwrap().unwrap();
+        for row in [&blank, &zero] {
+            assert_eq!(row.cells[1].value, Some(pb::cell::Value::Integer(0)));
+            assert!(!row.cells[0].blank, "the flag is for zoned numerics only");
+        }
+        assert!(blank.cells[1].blank, "an unwritten field says so");
+        assert!(!zero.cells[1].blank, "a written zero is not blank");
+
+        // The same layout laid over text: "ABCDE" has digit low nibbles all
+        // the way through, and is still not a number.
+        let mut stream = RecordStream::new(zoned(), options());
+        stream.push(&[0xc1, 0xc2, 0xc3, 0xc4, 0xc5]);
+        let err = stream.next_record().unwrap_err();
+        let ParseError::Invalid(message) = &err else {
+            panic!("got {err:?}")
+        };
+        assert!(message.contains("QTY"), "the field is named: {message}");
+        assert!(message.contains("zone"), "{message}");
     }
 
     #[test]

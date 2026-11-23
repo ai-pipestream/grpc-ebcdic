@@ -241,6 +241,12 @@ message Cell {
     // An unscaled whole number that fits in 64 bits.
     int64 integer = 5;
   }
+
+  // True when a zoned decimal field held nothing but EBCDIC blanks (0x40).
+  // An unwritten numeric looks like that on tape, and it reads as zero; the
+  // flag tells that zero apart from one the file actually stores. Never set
+  // for any other field type.
+  bool blank = 6;
 }
 
 // ConditionValue is one literal or one inclusive range of a level-88 VALUE

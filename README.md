@@ -147,7 +147,7 @@ Types survive. There is no JSON blob and no float anywhere on the value path.
 |---|---|
 | `STRING` (`PIC X`, `PIC A`) | `text`, decoded with the code page, controls stripped, trimmed |
 | `PACKED_DECIMAL` (`COMP-3`) | `integer` at scale 0, else `Decimal` |
-| `ZONED_DECIMAL` (signed `DISPLAY`) | `integer` at scale 0, else `Decimal` |
+| `ZONED_DECIMAL` (signed `DISPLAY`) | `integer` at scale 0, else `Decimal`; `blank` is set when the field held only EBCDIC blanks and so reads as zero |
 | `INTEGER` / `UNSIGNED_INTEGER` (`COMP`, `BINARY`) | `integer`, big-endian two's complement |
 | `SKIP` (`FILLER`) | no cell; the bytes are consumed |
 
@@ -277,7 +277,7 @@ no dangling refs), and every fold test asserts it comes back empty.
 |---|---|
 | No layout, malformed layout, malformed copybook | `INVALID_ARGUMENT` |
 | Overlapping fields, duplicate selectors, duplicate field names | `INVALID_ARGUMENT` |
-| Bad COMP-3 nibble, non-decimal zoned digit, unassigned code-page byte | `INVALID_ARGUMENT` |
+| Bad COMP-3 nibble, non-decimal zoned digit, zoned byte that is not a digit (text or low-values in a numeric field), unassigned code-page byte | `INVALID_ARGUMENT` |
 | Record length shorter than its own prefix or than its schema | `INVALID_ARGUMENT` |
 | Copybook feature outside the supported subset | `UNIMPLEMENTED` |
 | Field wider than the decoders handle | `UNIMPLEMENTED` |
