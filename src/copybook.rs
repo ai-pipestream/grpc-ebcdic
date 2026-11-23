@@ -476,15 +476,15 @@ fn parse_item(statement: &Statement) -> Result<Parsed, ParseError> {
                 usage = usage_of(other);
                 index += 1;
             }
-            other if ignorable(other) => {
-                // `VALUE` swallows its literal, which may be several tokens
-                // for a figurative constant such as `ALL SPACES`.
-                if other == "VALUE" || other == "VALUES" {
-                    index = tokens.len();
-                } else {
-                    index += 1;
-                }
+            // `VALUE` takes exactly one literal, and COBOL lets the clauses
+            // of an item come in any order, so `USAGE` and `OCCURS` may
+            // follow it. Only the literal is stepped over: what comes after
+            // still describes the bytes, and is applied or refused like any
+            // other clause.
+            "VALUE" | "VALUES" => {
+                index = value_literal_end(&tokens, index + 1, name.as_deref())?;
             }
+            other if ignorable(other) => index += 1,
             other => {
                 return Err(ParseError::invalid(format!(
                     "unrecognized clause {other:?} in copybook item {:?}",
@@ -502,6 +502,72 @@ fn parse_item(statement: &Statement) -> Result<Parsed, ParseError> {
         occurs,
         conditions: Vec::new(),
     }))
+}
+
+/// Step over the literal of a data item's `VALUE` clause, returning the index
+/// of the token after it.
+///
+/// The literal is `[IS] [ALL] literal`: a quoted string with or without a
+/// type prefix (`X'F1'`), a number, or a figurative constant. Anything else
+/// in that position is refused rather than skipped, because skipping a token
+/// that is really a clause is how `VALUE ZERO COMP-3` once compiled as a
+/// zoned field.
+fn value_literal_end(
+    tokens: &[String],
+    start: usize,
+    name: Option<&str>,
+) -> Result<usize, ParseError> {
+    let mut index = start;
+    if matches!(tokens.get(index).map(String::as_str), Some("IS" | "ARE")) {
+        index += 1;
+    }
+    if tokens.get(index).map(String::as_str) == Some("ALL") {
+        index += 1;
+    }
+    let name = name.unwrap_or("FILLER");
+    match tokens.get(index) {
+        Some(token) if is_value_literal(token) => Ok(index + 1),
+        Some(token) => Err(ParseError::invalid(format!(
+            "VALUE clause of {name:?} is followed by {token:?}, which is not a literal"
+        ))),
+        None => Err(ParseError::invalid(format!(
+            "VALUE clause of {name:?} has no literal"
+        ))),
+    }
+}
+
+/// Whether an upper-cased token can be the literal of a `VALUE` clause.
+fn is_value_literal(token: &str) -> bool {
+    // A quoted literal is one token, quotes included, and may carry a type
+    // prefix such as `X`, `N` or `G` in front of the opening quote.
+    if token.ends_with(['\'', '"']) {
+        return true;
+    }
+    // A numeric literal: digits with an optional sign, decimal point and
+    // exponent. A lone sign or point is not one.
+    if token.bytes().any(|byte| byte.is_ascii_digit())
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'.' | b'E'))
+    {
+        return true;
+    }
+    matches!(
+        token,
+        "ZERO"
+            | "ZEROS"
+            | "ZEROES"
+            | "SPACE"
+            | "SPACES"
+            | "HIGH-VALUE"
+            | "HIGH-VALUES"
+            | "LOW-VALUE"
+            | "LOW-VALUES"
+            | "QUOTE"
+            | "QUOTES"
+            | "NULL"
+            | "NULLS"
+    )
 }
 
 /// Parse one level-88 entry into the condition name it declares.
@@ -1364,6 +1430,78 @@ mod tests {
             .unwrap()
             .records[0];
         assert_eq!(record.fields.len(), 2);
+    }
+
+    #[test]
+    fn clauses_written_after_value_still_apply() {
+        // VALUE may come before USAGE or OCCURS; the literal is one token (or
+        // ALL plus one token), and what follows it is still the item's own.
+        let record = &compile(
+            "01 REC.\n\
+             05 AMT PIC S9(7)V99 VALUE ZERO COMP-3.\n\
+             05 CNT PIC S9(4) VALUE IS -12 COMP.\n\
+             05 TAG PIC X(2) VALUE ALL '*' OCCURS 3 TIMES.\n\
+             05 HEX PIC X(2) VALUE X'F1F2'.\n\
+             05 RATE PIC 9V99 VALUE 1.25.\n\
+             05 PAD PIC X(4) VALUE SPACES.\n",
+        )
+        .unwrap()
+        .records[0];
+        let shape: Vec<_> = record
+            .fields
+            .iter()
+            .map(|f| (f.name.as_str(), f.size, f.kind))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("AMT", 5, FieldKind::PackedDecimal),
+                ("CNT", 2, FieldKind::Integer),
+                ("TAG(1)", 2, FieldKind::Text),
+                ("TAG(2)", 2, FieldKind::Text),
+                ("TAG(3)", 2, FieldKind::Text),
+                ("HEX", 2, FieldKind::Text),
+                ("RATE", 3, FieldKind::ZonedDecimal),
+                ("PAD", 4, FieldKind::Text),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_refused_clause_after_value_is_still_refused() {
+        for (source, needle) in [
+            ("01 REC.\n05 A PIC S9(4) VALUE 0 COMP-5.\n", "COMP-5"),
+            (
+                "01 REC.\n05 A PIC S9(4) COMP VALUE ZERO SYNC.\n",
+                "SYNCHRONIZED",
+            ),
+            (
+                "01 REC.\n05 N PIC 9(3).\n05 T PIC X(2) VALUE SPACES OCCURS 3 DEPENDING ON N.\n",
+                "DEPENDING",
+            ),
+        ] {
+            let err = compile(source).unwrap_err();
+            assert!(
+                matches!(&err, ParseError::Unsupported(m) if m.contains(needle)),
+                "{source:?} should be UNIMPLEMENTED mentioning {needle}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_clause_without_a_literal_is_invalid_argument() {
+        for source in [
+            "01 REC.\n05 A PIC X(2) VALUE.\n",
+            "01 REC.\n05 A PIC X(2) VALUE IS.\n",
+            "01 REC.\n05 A PIC S9(4) VALUE COMP-3.\n",
+            "01 REC.\n05 A PIC X(2) VALUE ALL.\n",
+        ] {
+            let err = compile(source).unwrap_err();
+            assert!(
+                matches!(&err, ParseError::Invalid(m) if m.contains("VALUE")),
+                "{source:?} should be INVALID_ARGUMENT naming VALUE, got {err:?}"
+            );
+        }
     }
 
     #[test]
