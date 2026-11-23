@@ -149,28 +149,51 @@ pub fn decode_packed(bytes: &[u8]) -> Result<i128, ParseError> {
     })
 }
 
+/// The EBCDIC blank, which pads an unwritten field.
+const BLANK: u8 = 0x40;
+
+/// The zone nibble of an unsigned zoned digit, `0xf0`..`0xf9`.
+const DIGIT_ZONE: u8 = 0x0f;
+
 /// Decode a zoned decimal (signed `USAGE DISPLAY` numeric): one digit in the
 /// low nibble of every byte, the sign overpunched into the zone nibble of the
 /// last byte.
 ///
-/// The zone nibbles of the leading bytes are deliberately not checked. They
-/// are `0xf` in well-formed EBCDIC numerics, but blank-filled fields arrive as
-/// `0x40` and mainframe programs read those as zeros; rejecting them would
-/// refuse files that COBOL itself accepts. The digit nibbles are checked,
-/// which is where real corruption shows up.
+/// Both nibbles of every byte are checked. The leading bytes must be digits
+/// with the `0xf` zone, and the last byte a digit under a sign zone
+/// (`0xa`..`0xf`, the same nibbles a packed field signs with). Checking only
+/// the low nibbles would read text as numbers: EBCDIC `A`..`I` and `J`..`R`
+/// are `0xc1`..`0xc9` and `0xd1`..`0xd9`, so a layout that has drifted onto a
+/// name column would come back as a column of plausible integers.
+///
+/// Blanks are the one thing accepted beside digits, because they are what an
+/// unwritten field looks like on tape: leading blanks in front of digits pad
+/// the number and count as zeros, and a field of nothing but blanks is zero.
+/// [`is_blank`] tells that zero from a stored one. A blank after a digit is
+/// refused, since `7` followed by a blank could be 7 or 70.
 ///
 /// # Errors
 ///
-/// [`ParseError::Invalid`] when the field is empty or a low nibble is above
-/// nine.
+/// [`ParseError::Invalid`] when the field is empty, or a byte is neither a
+/// zoned digit nor leading blank padding.
 pub fn decode_zoned(bytes: &[u8]) -> Result<i128, ParseError> {
     if bytes.is_empty() {
         return Err(ParseError::invalid(
             "a zoned decimal field needs at least one byte",
         ));
     }
+    if is_blank(bytes) {
+        return Ok(0);
+    }
+    let last = bytes.len() - 1;
     let mut value: i128 = 0;
+    let mut padding = true;
     for (index, &byte) in bytes.iter().enumerate() {
+        if padding && byte == BLANK && index != last {
+            continue;
+        }
+        padding = false;
+        let zone = byte >> 4;
         let digit = byte & 0x0f;
         if digit > 9 {
             return Err(ParseError::invalid(format!(
@@ -178,14 +201,40 @@ pub fn decode_zoned(bytes: &[u8]) -> Result<i128, ParseError> {
                 hex(bytes)
             )));
         }
+        let zone_fits = if index == last {
+            zone >= 0x0a
+        } else {
+            zone == DIGIT_ZONE
+        };
+        if !zone_fits {
+            let expected = if index == last {
+                "a sign zone (0xa to 0xf)"
+            } else {
+                "the digit zone 0xf"
+            };
+            return Err(ParseError::invalid(format!(
+                "zoned decimal byte {index} is 0x{byte:02x}, whose zone 0x{zone:x} is not \
+                 {expected}, so the field holds something other than a number (bytes {})",
+                hex(bytes)
+            )));
+        }
         value = value * 10 + i128::from(digit);
     }
-    let sign = bytes[bytes.len() - 1] >> 4;
+    let sign = bytes[last] >> 4;
     Ok(if NEGATIVE_SIGNS.contains(&sign) {
         -value
     } else {
         value
     })
+}
+
+/// Whether a field holds nothing but EBCDIC blanks.
+///
+/// A zoned decimal that does reads as zero, and the wire cell carries this as
+/// `Cell.blank` so a consumer can tell an unwritten field from a stored zero.
+#[must_use]
+pub fn is_blank(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && bytes.iter().all(|&byte| byte == BLANK)
 }
 
 /// Decode a big-endian binary field (`COMP` / `COMP-4` / `BINARY`).
@@ -240,7 +289,8 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FieldValue, decode_binary, decode_packed, decode_text, decode_zoned, render_decimal,
+        FieldValue, decode_binary, decode_packed, decode_text, decode_zoned, is_blank,
+        render_decimal,
     };
     use crate::codec::Codec;
     use crate::error::ParseError;
@@ -312,6 +362,59 @@ mod tests {
             panic!("got {err:?}")
         };
         assert!(message.contains("digit 1"), "{message}");
+    }
+
+    #[test]
+    fn zoned_decimal_rejects_text_in_a_numeric_field() {
+        // EBCDIC "AB" is c1 c2 and "JK" is d1 d2: their low nibbles are
+        // digits, which is how a layout that has drifted onto a name column
+        // used to come back as a column of plausible integers.
+        for bytes in [
+            &[0xc1, 0xc2][..],
+            &[0xd1, 0xd2],
+            // A blank after a digit, at the end or in the middle, is not
+            // padding: "7 " could be 7 or 70.
+            &[0xf7, 0x40],
+            &[0xf1, 0x40, 0xf2],
+            // Low-values are not digits either.
+            &[0x00, 0x00],
+            // A last byte with no sign or digit zone.
+            &[0xf1, 0x92],
+        ] {
+            let err = decode_zoned(bytes).unwrap_err();
+            let ParseError::Invalid(message) = &err else {
+                panic!("{bytes:02x?} is the caller's problem, got {err:?}")
+            };
+            assert!(message.contains("zone"), "{bytes:02x?}: {message}");
+        }
+        let err = decode_zoned(&[0xc1, 0xc2]).unwrap_err();
+        let ParseError::Invalid(message) = &err else {
+            panic!("got {err:?}")
+        };
+        assert!(message.contains("byte 0"), "{message}");
+        assert!(message.contains("c1c2"), "the bytes are quoted: {message}");
+    }
+
+    #[test]
+    fn zoned_decimal_reads_every_sign_zone_on_the_last_byte() {
+        // c0 and d0 are the overpunched zeros, printed as `{` and `}`.
+        assert_eq!(decode_zoned(&[0xf1, 0xc0]).unwrap(), 10);
+        assert_eq!(decode_zoned(&[0xf1, 0xd0]).unwrap(), -10);
+        // The alternates, as for packed: a and e positive, b negative.
+        assert_eq!(decode_zoned(&[0xf1, 0xa2]).unwrap(), 12);
+        assert_eq!(decode_zoned(&[0xf1, 0xe2]).unwrap(), 12);
+        assert_eq!(decode_zoned(&[0xf1, 0xb2]).unwrap(), -12);
+        // A one-byte field is all sign byte.
+        assert_eq!(decode_zoned(&[0xd5]).unwrap(), -5);
+    }
+
+    #[test]
+    fn an_all_blank_zoned_field_is_zero_and_says_it_was_blank() {
+        assert_eq!(decode_zoned(&[0x40, 0x40, 0x40]).unwrap(), 0);
+        assert!(is_blank(&[0x40, 0x40, 0x40]));
+        assert!(!is_blank(&[0x40, 0x40, 0xf0]));
+        assert!(!is_blank(&[0xf0]));
+        assert!(!is_blank(&[]));
     }
 
     #[test]
