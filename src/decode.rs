@@ -111,10 +111,11 @@ pub fn decode_text(codec: Codec, bytes: &[u8], strip_control: bool) -> Result<St
 ///
 /// # Errors
 ///
-/// [`ParseError::Invalid`] when the field is empty or any digit nibble is
-/// above nine. A nibble of `0xa`..`0xf` anywhere but the sign position is the
-/// classic symptom of a layout whose offsets have drifted, so it is reported
-/// with the nibble's position rather than as a generic parse failure.
+/// [`ParseError::Invalid`] when the field is empty, any digit nibble is above
+/// nine, or the sign nibble is a digit. A nibble of `0xa`..`0xf` anywhere but
+/// the sign position, or a digit in it, is the classic symptom of a layout
+/// whose offsets have drifted, so it is reported with the nibble's position
+/// rather than as a generic parse failure.
 pub fn decode_packed(bytes: &[u8]) -> Result<i128, ParseError> {
     if bytes.is_empty() {
         return Err(ParseError::invalid(
@@ -142,6 +143,16 @@ pub fn decode_packed(bytes: &[u8]) -> Result<i128, ParseError> {
         }
     }
     let sign = bytes[last] & 0x0f;
+    // `0xa`..`0xf` are the only signs. A digit here means the field has no
+    // sign nibble, so the bytes are not the packed number the layout says
+    // they are, and the digit that sits here would otherwise be dropped.
+    if sign < 0x0a {
+        return Err(ParseError::invalid(format!(
+            "packed decimal sign nibble is 0x{sign:x}, a digit where the sign belongs \
+             (bytes {})",
+            hex(bytes)
+        )));
+    }
     Ok(if NEGATIVE_SIGNS.contains(&sign) {
         -value
     } else {
@@ -271,6 +282,26 @@ mod tests {
             message.contains("1a345c"),
             "the offending bytes are quoted: {message}"
         );
+    }
+
+    #[test]
+    fn packed_decimal_rejects_a_digit_where_the_sign_belongs() {
+        // 12 34 56 has no sign nibble at all: the layout has drifted, or the
+        // field is not packed. Reading it as +12345 would drop the 6.
+        for last in 0x50..=0x59_u8 {
+            let bytes = [0x12, 0x34, last];
+            let err = decode_packed(&bytes).unwrap_err();
+            let ParseError::Invalid(message) = &err else {
+                panic!("a missing sign is the caller's problem, got {err:?}");
+            };
+            assert!(message.contains("sign nibble"), "{message}");
+            assert!(
+                message.contains(&format!("1234{last:02x}")),
+                "the offending bytes are quoted: {message}"
+            );
+        }
+        let err = decode_packed(&[0x07]).unwrap_err();
+        assert!(matches!(err, ParseError::Invalid(_)), "got {err:?}");
     }
 
     #[test]
