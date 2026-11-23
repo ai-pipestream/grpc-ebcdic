@@ -147,7 +147,7 @@ Types survive. There is no JSON blob and no float anywhere on the value path.
 |---|---|
 | `STRING` (`PIC X`, `PIC A`) | `text`, decoded with the code page, controls stripped, trimmed |
 | `PACKED_DECIMAL` (`COMP-3`) | `integer` at scale 0, else `Decimal` |
-| `ZONED_DECIMAL` (signed `DISPLAY`) | `integer` at scale 0, else `Decimal` |
+| `ZONED_DECIMAL` (signed `DISPLAY`) | `integer` at scale 0, else `Decimal`; `blank` is set when the field held only EBCDIC blanks and so reads as zero |
 | `INTEGER` / `UNSIGNED_INTEGER` (`COMP`, `BINARY`) | `integer`, big-endian two's complement |
 | `SKIP` (`FILLER`) | no cell; the bytes are consumed |
 
