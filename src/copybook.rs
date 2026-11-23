@@ -268,8 +268,9 @@ struct Item {
     name: Option<String>,
     /// Picture clause, absent for group items.
     picture: Option<String>,
-    /// Declared usage.
-    usage: Usage,
+    /// Usage the item itself declares, absent when it names none and so
+    /// takes its group's, or `DISPLAY` when no group above it names one.
+    usage: Option<Usage>,
     /// `OCCURS` count, absent when the item is not a table.
     occurs: Option<u32>,
     /// Level-88 condition names declared under this item, in source order.
@@ -293,6 +294,17 @@ enum Usage {
     Packed,
     /// `COMP` / `COMP-4` / `BINARY`.
     Binary,
+}
+
+impl Usage {
+    /// The clause as a copybook writes it, for error messages.
+    fn clause(self) -> &'static str {
+        match self {
+            Self::Display => "DISPLAY",
+            Self::Packed => "COMP-3",
+            Self::Binary => "COMP",
+        }
+    }
 }
 
 /// Clause keywords that introduce a usage.
@@ -498,7 +510,7 @@ fn parse_item(statement: &Statement) -> Result<Parsed, ParseError> {
         level,
         name,
         picture,
-        usage: usage.unwrap_or(Usage::Display),
+        usage,
         occurs,
         conditions: Vec::new(),
     }))
@@ -656,21 +668,49 @@ fn is_clause_keyword(token: &str) -> bool {
         || refused(token).is_some()
 }
 
+/// The usage that applies to an item: its own, or the one its group declares.
+///
+/// A `USAGE` clause on a group item applies to every elementary item under
+/// it. An item may restate it, and may not contradict it.
+fn usage_in_force(
+    item: &Item,
+    groups: &[(u8, String, Option<Usage>)],
+) -> Result<Option<Usage>, ParseError> {
+    let inherited = groups
+        .iter()
+        .rev()
+        .find_map(|(_, group, usage)| usage.map(|usage| (group.as_str(), usage)));
+    if let (Some(own), Some((group, usage))) = (item.usage, inherited)
+        && own != usage
+    {
+        return Err(ParseError::invalid(format!(
+            "item {:?} declares USAGE {} inside the group {group:?}, which declares USAGE {}",
+            item.name.as_deref().unwrap_or("FILLER"),
+            own.clause(),
+            usage.clause()
+        )));
+    }
+    Ok(item.usage.or(inherited.map(|(_, usage)| usage)))
+}
+
 /// Walk the level tree and emit the elementary fields in physical order.
 ///
 /// The tree is flattened because the record is flat, but nothing about it is
 /// thrown away: every field keeps its level number and the dotted path of the
 /// group items it sits under, which is how a mainframe consumer names it.
 fn flatten(items: &[Item], out: &mut Vec<RawField>) -> Result<(), ParseError> {
-    // The group items currently open, innermost last, as (level, name).
-    let mut groups: Vec<(u8, String)> = Vec::new();
+    // The group items currently open, innermost last, as (level, name,
+    // usage). A group's usage is the one in force under it: its own, or the
+    // one it inherited.
+    let mut groups: Vec<(u8, String, Option<Usage>)> = Vec::new();
     // The record so far, checked before each expansion rather than after the
     // whole record, so a copybook of OCCURS items cannot allocate millions of
     // fields before validation gets to see their sum.
     let mut record_bytes: u64 = 0;
     let mut conditions = ConditionWeight::default();
     for (index, item) in items.iter().enumerate() {
-        groups.retain(|(level, _)| *level < item.level);
+        groups.retain(|(level, _, _)| *level < item.level);
+        let usage = usage_in_force(item, &groups)?;
         let label = item.name.clone().unwrap_or_else(|| "FILLER".to_string());
         let is_group = items
             .get(index + 1)
@@ -691,7 +731,7 @@ fn flatten(items: &[Item], out: &mut Vec<RawField>) -> Result<(), ParseError> {
             }
             // Children are emitted by their own iteration; a group contributes
             // no bytes of its own, only a segment of their path.
-            groups.push((item.level, label));
+            groups.push((item.level, label, usage));
             continue;
         }
         let Some(picture) = item.picture.as_deref() else {
@@ -700,7 +740,11 @@ fn flatten(items: &[Item], out: &mut Vec<RawField>) -> Result<(), ParseError> {
                 item.name.as_deref().unwrap_or("FILLER")
             )));
         };
-        let described = describe(picture, item.usage, item.name.as_deref())?;
+        let described = describe(
+            picture,
+            usage.unwrap_or(Usage::Display),
+            item.name.as_deref(),
+        )?;
         let kind = if item.name.is_none() {
             FieldKind::Skip
         } else {
@@ -714,7 +758,7 @@ fn flatten(items: &[Item], out: &mut Vec<RawField>) -> Result<(), ParseError> {
                 return String::new();
             }
             let mut path = String::new();
-            for (_, group) in &groups {
+            for (_, group, _) in &groups {
                 path.push_str(group);
                 path.push('.');
             }
@@ -1096,6 +1140,58 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("STREET", 20), ("CITY", 10), ("ZIP", 5)]
         );
+    }
+
+    #[test]
+    fn a_usage_on_a_group_item_applies_to_the_items_under_it() {
+        let source = "01 REC.\n\
+                      05 AMOUNTS COMP-3.\n\
+                      10 A PIC S9(5).\n\
+                      10 B PIC S9(7)V99 COMP-3.\n\
+                      05 COUNTS USAGE IS BINARY.\n\
+                      10 INNER.\n\
+                      15 N PIC S9(4).\n\
+                      05 Z PIC 9(2).\n";
+        let record = &compile(source).unwrap().records[0];
+        assert_eq!(
+            record
+                .fields
+                .iter()
+                .map(|f| (f.name.as_str(), f.size, f.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                // Three packed bytes, not five zoned ones.
+                ("A", 3, FieldKind::PackedDecimal),
+                ("B", 5, FieldKind::PackedDecimal),
+                // Inherited through a nested group that names no usage.
+                ("N", 2, FieldKind::Integer),
+                // The group has closed, so the default is back.
+                ("Z", 2, FieldKind::ZonedDecimal),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_usage_that_contradicts_its_group_is_invalid_argument() {
+        for source in [
+            "01 REC.\n05 G COMP-3.\n10 A PIC S9(5) COMP.\n",
+            "01 REC.\n05 G COMP.\n10 H COMP-3.\n15 A PIC S9(5).\n",
+            "01 REC.\n05 G COMP-3.\n10 A PIC S9(5) USAGE DISPLAY.\n",
+            // A character item cannot be computational, by inheritance either.
+            "01 REC.\n05 G COMP-3.\n10 A PIC X(4).\n",
+        ] {
+            let err = compile(source).unwrap_err();
+            assert!(
+                matches!(&err, ParseError::Invalid(_)),
+                "{source:?} should be INVALID_ARGUMENT, got {err:?}"
+            );
+        }
+        let err = compile("01 REC.\n05 G COMP-3.\n10 A PIC S9(5) COMP.\n").unwrap_err();
+        let ParseError::Invalid(message) = &err else {
+            panic!("got {err:?}")
+        };
+        assert!(message.contains("\"A\""), "the item is named: {message}");
+        assert!(message.contains("\"G\""), "the group is named: {message}");
     }
 
     #[test]

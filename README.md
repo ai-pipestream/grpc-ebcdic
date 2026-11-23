@@ -369,7 +369,8 @@ so they become the condition list of the item they follow), group items nested
 to any depth and flattened to leaves, each field keeping its level number and
 the dotted path of the groups above it, `PIC
 X`/`A` character items, `PIC 9` numerics with a leading `S` and one `V`, `USAGE
-DISPLAY`, `COMP-3`/`PACKED-DECIMAL`, `COMP`/`COMP-4`/`BINARY`, `OCCURS n` on an
+DISPLAY`, `COMP-3`/`PACKED-DECIMAL`, `COMP`/`COMP-4`/`BINARY`, a usage written on
+a group item applied to every item under it, `OCCURS n` on an
 elementary item expanded to `NAME(1)` through `NAME(n)`, each expansion keeping
 its one-based index and the name of the item it repeats, `FILLER` and anonymous
 items, the byte-neutral clauses (`VALUE`, `JUSTIFIED`, `BLANK WHEN ZERO`,
