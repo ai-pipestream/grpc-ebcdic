@@ -1313,7 +1313,10 @@ mod tests {
         );
         // The condition under an elementary item still sits on its field.
         assert_eq!(record.fields[1].declaration.conditions[0].name, "B-YES");
-        assert!(record.fields[0].declaration.conditions.is_empty());
+        assert_eq!(
+            record.fields[0].declaration.conditions,
+            Vec::<ConditionName>::new()
+        );
     }
 
     #[test]
