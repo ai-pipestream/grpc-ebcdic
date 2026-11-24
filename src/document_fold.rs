@@ -380,6 +380,7 @@ impl DocumentFold {
             footer_bytes: Some(u64::from(info.footer_size)),
             prefix_bytes: Some(u64::from(info.prefix_size)),
             rows_truncated: None,
+            ..doc::RecordLayoutMeta::default()
         };
 
         // Four of the body's five keys now have that typed home and are the
@@ -880,6 +881,8 @@ fn table_cell(
         // No declared alignment: a fixed-record field states none.
         align: None,
         valign: None,
+        // No cell name: a record field is addressed by its column.
+        source_name: None,
     }
 }
 
