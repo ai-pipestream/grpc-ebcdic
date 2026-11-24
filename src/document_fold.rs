@@ -803,32 +803,53 @@ fn field_type_name(field_type: i32) -> Option<&'static str> {
     }
 }
 
-/// The typed value of one decoded cell, when it has one a `CellValue` can
-/// hold.
+/// The typed value of one decoded cell: `None` for a character field, whose
+/// value is its text.
 ///
-/// Text cells get none: `CellValue` has no text arm, and `TableCell.text` is
-/// already the whole of a character field. A numeric cell gets the nearest
-/// double, which is what the schema's `number` arm is; the exact value stays
-/// in `text`, because a scaled decimal is not generally representable in
-/// binary and a `PIC S9(18)V99 COMP-3` has more digits than a double has.
-/// The scale and the picture are not repeated on every cell: they belong to
-/// the column and are declared once, in `TableData.columns`.
-#[allow(clippy::cast_precision_loss)]
+/// A numeric cell is exact on both arms. A scaled or over-wide value is an
+/// `ExactDecimal` built from the canonical rendering, so a `PIC S9(16)V99
+/// COMP-3` amount keeps all eighteen digits a double would round away; a
+/// 64-bit integer is the `integer` arm, which holds what a double cannot
+/// past 2^53. The scale and the picture are also declared once on the
+/// column, in `TableData.columns`.
 fn cell_value(cell: &pb::Cell) -> Option<doc::CellValue> {
-    let number = match cell.value.as_ref()? {
+    let kind = match cell.value.as_ref()? {
         pb::cell::Value::Text(_) => return None,
-        // Parsed from the canonical text rather than rebuilt from `unscaled`,
-        // so the rounding happens once and against the value the reader sees.
-        pb::cell::Value::Decimal(decimal) => decimal.text.parse::<f64>().ok()?,
-        pb::cell::Value::Integer(integer) => *integer as f64,
+        pb::cell::Value::Decimal(decimal) => {
+            doc::cell_value::Kind::Decimal(exact_decimal(&decimal.text, decimal.scale))
+        }
+        pb::cell::Value::Integer(integer) => doc::cell_value::Kind::Integer(*integer),
     };
     Some(doc::CellValue {
-        kind: Some(doc::cell_value::Kind::Number(number)),
+        kind: Some(kind),
         number_format: None,
         formula_source: None,
         number_format_id: None,
         style_id: None,
     })
+}
+
+/// An exact decimal from the decoder's canonical rendering (`-123.45`) and
+/// its scale: the digits with the point taken out, leading zeros dropped,
+/// and a negative zero written as zero.
+fn exact_decimal(text: &str, scale: u32) -> doc::ExactDecimal {
+    let (negative, digits) = text
+        .strip_prefix('-')
+        .map_or((false, text), |rest| (true, rest));
+    let digits: String = digits.chars().filter(char::is_ascii_digit).collect();
+    let digits = digits.trim_start_matches('0');
+    let unscaled = if digits.is_empty() {
+        "0".to_owned()
+    } else if negative {
+        format!("-{digits}")
+    } else {
+        digits.to_owned()
+    };
+    doc::ExactDecimal {
+        unscaled,
+        // A picture states at most a few dozen fractional digits.
+        scale: i32::try_from(scale).unwrap_or(i32::MAX),
+    }
 }
 
 /// Render one decoded cell as table text.
@@ -1247,16 +1268,33 @@ mod tests {
             .map(|span| (span.start, span.end))
     }
 
-    /// The typed value of one grid cell, which for this collector is a number
-    /// or nothing at all.
-    fn cell_number(table: &doc::TableItem, row: usize, column: usize) -> Option<f64> {
+    /// The typed value of one grid cell, which for this collector is an
+    /// exact decimal, an exact integer, or nothing at all.
+    fn cell_kind(
+        table: &doc::TableItem,
+        row: usize,
+        column: usize,
+    ) -> Option<doc::cell_value::Kind> {
         let value = table.data.as_ref().unwrap().grid[row].cells[column]
             .value
             .as_ref()?;
-        match value.kind.as_ref().expect("a value with no arm set") {
-            doc::cell_value::Kind::Number(number) => Some(*number),
-            other => panic!("an EBCDIC cell is a number or nothing, not {other:?}"),
-        }
+        let kind = value.kind.clone().expect("a value with no arm set");
+        assert!(
+            matches!(
+                kind,
+                doc::cell_value::Kind::Decimal(_) | doc::cell_value::Kind::Integer(_)
+            ),
+            "an EBCDIC cell is exact or nothing, not {kind:?}"
+        );
+        Some(kind)
+    }
+
+    /// An exact decimal, as the Document plane writes it.
+    fn exact(unscaled: &str, scale: i32) -> doc::cell_value::Kind {
+        doc::cell_value::Kind::Decimal(doc::ExactDecimal {
+            unscaled: unscaled.to_owned(),
+            scale,
+        })
     }
 
     /// The base of a text item, whichever variant it is.
@@ -1549,12 +1587,11 @@ mod tests {
         let customers = &document.tables[0];
         // `CellValue` has no text arm and needs none: a character field is
         // already the whole of `TableCell.text`.
-        assert_eq!(cell_number(customers, 1, 0), None);
+        assert_eq!(cell_kind(customers, 1, 0), None);
         assert_eq!(row_text(customers, 1)[0], "JANE");
         // The scaled packed decimal is a number a consumer can compute with,
         // and the exact rendering is still there beside it.
-        let balance = cell_number(customers, 1, 1).expect("a packed decimal is a number");
-        assert!((balance - -123.45).abs() < 1e-9, "{balance}");
+        assert_eq!(cell_kind(customers, 1, 1), Some(exact("-12345", 2)));
         assert_eq!(row_text(customers, 1)[1], "-123.45");
         // The scale lives on the column, once, rather than on every cell.
         assert_eq!(
@@ -1563,10 +1600,49 @@ mod tests {
         );
 
         let orders = &document.tables[1];
-        let quantity = cell_number(orders, 1, 0).expect("a zoned integer is a number");
-        assert!((quantity - 42.0).abs() < f64::EPSILON, "{quantity}");
+        assert_eq!(
+            cell_kind(orders, 1, 0),
+            Some(doc::cell_value::Kind::Integer(42))
+        );
         // A header cell is a label, not a value.
-        assert_eq!(cell_number(orders, 0, 0), None);
+        assert_eq!(cell_kind(orders, 0, 0), None);
+    }
+
+    #[test]
+    fn amounts_and_integers_past_a_double_keep_every_digit() {
+        use super::cell_value;
+        let decimal = |text: &str, scale: u32| pb::Cell {
+            value: Some(pb::cell::Value::Decimal(pb::Decimal {
+                text: text.into(),
+                scale,
+                ..pb::Decimal::default()
+            })),
+            ..pb::Cell::default()
+        };
+        let kind = |cell: &pb::Cell| cell_value(cell).and_then(|value| value.kind);
+        // A PIC S9(16)V99 COMP-3 amount has eighteen significant digits; a
+        // double keeps fifteen or so.
+        assert_eq!(
+            kind(&decimal("1234567890123456.78", 2)),
+            Some(exact("123456789012345678", 2))
+        );
+        // Wider than an int64: the digits still all arrive.
+        assert_eq!(
+            kind(&decimal("-123456789012345678901.5", 1)),
+            Some(exact("-1234567890123456789015", 1))
+        );
+        assert_eq!(kind(&decimal("0.05", 2)), Some(exact("5", 2)));
+        assert_eq!(kind(&decimal("-0.00", 2)), Some(exact("0", 2)));
+        assert_eq!(kind(&decimal("1200", 0)), Some(exact("1200", 0)));
+        // 2^53 + 1, which a double rounds to 2^53.
+        let integer = pb::Cell {
+            value: Some(pb::cell::Value::Integer(9_007_199_254_740_993)),
+            ..pb::Cell::default()
+        };
+        assert_eq!(
+            kind(&integer),
+            Some(doc::cell_value::Kind::Integer(9_007_199_254_740_993))
+        );
     }
 
     #[test]

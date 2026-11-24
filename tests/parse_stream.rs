@@ -1614,12 +1614,14 @@ async fn a_folded_document_carries_typed_values_and_record_byte_extents() {
     // still beside it.
     let balance = &table_data.grid[1].cells[2];
     assert_eq!(balance.text, "-1234567.89");
-    let Some(docpb::cell_value::Kind::Number(number)) =
-        balance.value.as_ref().and_then(|value| value.kind.as_ref())
-    else {
-        panic!("a packed decimal is a number, not {:?}", balance.value);
-    };
-    assert!((number - -1_234_567.89).abs() < 1e-6, "{number}");
+    assert_eq!(
+        balance.value.as_ref().and_then(|value| value.kind.clone()),
+        Some(docpb::cell_value::Kind::Decimal(docpb::ExactDecimal {
+            unscaled: "-123456789".into(),
+            scale: 2,
+        })),
+        "a packed decimal is an exact decimal"
+    );
     // A character field is its text and nothing more.
     assert!(table_data.grid[1].cells[1].value.is_none());
 
