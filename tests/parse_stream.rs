@@ -1485,7 +1485,7 @@ async fn a_folded_document_carries_the_layout_facts_and_the_row_count() {
     assert_eq!(declared.footer_bytes, Some(0));
     assert_eq!(declared.prefix_bytes, Some(0));
     assert_eq!(declared.rows_truncated, Some(0));
-    assert_eq!(declared.rows, Some(1));
+    assert_eq!(declared.rows, Some(2), "AAAA and BBBB");
     assert!(declared.schema_name.is_some(), "the schema is named");
     assert_ne!(declared.layout_source, 0, "the layout's form is stated");
 
