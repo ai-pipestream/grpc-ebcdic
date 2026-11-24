@@ -1451,30 +1451,27 @@ async fn a_folded_document_carries_the_layout_facts_and_the_row_count() {
     };
     assert_eq!(opening.base.as_ref().unwrap().text, "NIGHTLY EXTRACT");
 
-    let fields = &document
-        .body
-        .as_ref()
-        .unwrap()
-        .meta
-        .as_ref()
-        .unwrap()
-        .custom_fields;
-    assert!(fields.contains_key("ebcdic.encoding"));
-    assert!(fields.contains_key("ebcdic.layout_source"));
-    assert!(fields.contains_key("ebcdic.header_size"));
-    assert!(fields.contains_key("ebcdic.footer_size"));
-    assert!(fields.contains_key("ebcdic.prefix_size"));
+    // No stringly keyed bag on the body or the table: the facts are typed.
+    for fields in [
+        document
+            .body
+            .as_ref()
+            .unwrap()
+            .meta
+            .as_ref()
+            .map(|meta| &meta.custom_fields),
+        document.tables[0]
+            .meta
+            .as_ref()
+            .map(|meta| &meta.custom_fields),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert_eq!(fields.keys().collect::<Vec<_>>(), Vec::<&String>::new());
+    }
 
-    let fields = &document.tables[0].meta.as_ref().unwrap().custom_fields;
-    assert!(fields.contains_key("ebcdic.schema"));
-    assert!(fields.contains_key("ebcdic.record_length"));
-    assert!(fields.contains_key("ebcdic.rows"));
-    assert!(
-        !fields.contains_key("ebcdic.rows_truncated"),
-        "nothing was dropped, so nothing claims to have been"
-    );
-
-    // The same facts typed, which is where a reader should now go for them.
+    // The facts, typed.
     let declared = document.tables[0]
         .data
         .as_ref()
@@ -1488,6 +1485,9 @@ async fn a_folded_document_carries_the_layout_facts_and_the_row_count() {
     assert_eq!(declared.footer_bytes, Some(0));
     assert_eq!(declared.prefix_bytes, Some(0));
     assert_eq!(declared.rows_truncated, Some(0));
+    assert_eq!(declared.rows, Some(1));
+    assert!(declared.schema_name.is_some(), "the schema is named");
+    assert_ne!(declared.layout_source, 0, "the layout's form is stated");
 
     assert!(
         parsed.status.warnings.is_empty(),

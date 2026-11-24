@@ -226,32 +226,24 @@ Every item the fold creates carries
 pages: this stream has byte offsets and a layout, not a page and not a
 filename. A table carries no `prov` of its own either, because the records of
 one schema are interleaved with every other schema's and span no single range.
-The layout facts are typed, in every table's `data.record_layout`. They are
-also still written as the `ebcdic.*` custom fields they used to be, on
-`body.meta.custom_fields` and each table's `meta.custom_fields`, and those are
-duplicates kept for one release:
+The layout facts are typed, in every table's `data.record_layout`, and no
+`custom_fields` bag is written on the body or the tables. The `ebcdic.*`
+custom fields earlier releases wrote map to these fields:
 
-| Custom field | Where it is written | Typed home |
-|---|---|---|
-| `ebcdic.encoding` | body | `data.record_layout.encoding` |
-| `ebcdic.header_size` | body | `data.record_layout.header_bytes` |
-| `ebcdic.footer_size` | body | `data.record_layout.footer_bytes` |
-| `ebcdic.prefix_size` | body | `data.record_layout.prefix_bytes` |
-| `ebcdic.record_length` | table | `data.record_layout.record_length` |
-| `ebcdic.rows_truncated` | table | `data.record_layout.rows_truncated` |
-| `ebcdic.rows` | table | `data.num_rows`, less the header row |
-| `ebcdic.layout_source` | body | `CollectorSource.model` |
-| `ebcdic.schema` | table | none: it stays a custom field |
-| `ebcdic.selector` | table | none: it stays a custom field |
+| Former custom field | Typed home |
+|---|---|
+| `ebcdic.encoding` (body) | `data.record_layout.encoding` |
+| `ebcdic.header_size` (body) | `data.record_layout.header_bytes` |
+| `ebcdic.footer_size` (body) | `data.record_layout.footer_bytes` |
+| `ebcdic.prefix_size` (body) | `data.record_layout.prefix_bytes` |
+| `ebcdic.layout_source` (body) | `data.record_layout.layout_source`, and `CollectorSource.model` |
+| `ebcdic.record_length` | `data.record_layout.record_length` |
+| `ebcdic.rows_truncated` | `data.record_layout.rows_truncated`, always set, zero for a complete table |
+| `ebcdic.rows` | `data.record_layout.rows`: every record the schema matched, the ones past the row cap included |
+| `ebcdic.schema` | `data.record_layout.schema_name` |
+| `ebcdic.selector` | `data.record_layout.selector` |
 
-The one asymmetry is `ebcdic.rows_truncated`, which is written only when rows
-were dropped, as it always has been, while the typed
-`record_layout.rows_truncated` is always set and reads zero for a complete
-table. `the_deprecated_layout_custom_fields_are_still_emitted_beside_the_typed_ones`
-in `src/document_fold.rs` asserts both halves are written, so the window ends
-when someone deletes that test and not by accident.
-
-`ebcdic.schema` deserves a note. A heading names a schema only when the layout
+`schema_name` deserves a note. A heading names a schema only when the layout
 has more than one, so a single-schema document would lose the name entirely.
 Every table here says which copybook record it holds, heading or not.
 

@@ -46,10 +46,11 @@
 //!   record has.
 //! - `TableData.record_layout` is the fixed-record layout the table was
 //!   decoded with, typed: the code page, the record length, the header,
-//!   footer and prefix byte trims, and the number of rows the fold's own cap
-//!   dropped. Those facts used to be stringly-typed `ebcdic.*` custom fields
-//!   on the body and the table, which are still written for one release and
-//!   are no longer the truth.
+//!   footer and prefix byte trims, the copybook record's name and the selector
+//!   its records matched, how many records it matched and how many of those
+//!   the fold's own cap dropped, and the form the layout arrived in. Those
+//!   facts used to be stringly-typed `ebcdic.*` custom fields on the body and
+//!   the table; no custom field bag is written any more.
 //! - `TableColumnSchema.conditions` is the level-88 condition names of the
 //!   column, each one a named list of literals and inclusive ranges with the
 //!   bounds apart and spelled the way the copybook spelled them.
@@ -61,11 +62,10 @@
 //! `FieldSchema.conditions`, which is the lossless view and the one a client
 //! of the row stream reads.
 //!
-//! One thing is deliberately kept past docling: every table carries its schema
-//! name in `meta.custom_fields["ebcdic.schema"]`. Upstream loses that name
-//! entirely in the single-schema case, where it emits no heading, and a table
-//! that cannot say which copybook record it holds is worth less than the two
-//! dozen bytes the field costs.
+//! One thing is deliberately kept past docling: every table names its
+//! schema, in `record_layout.schema_name`. Upstream loses that name entirely
+//! in the single-schema case, where it emits no heading, and a table that
+//! cannot say which copybook record it holds is worth less.
 //!
 //! Two properties are load-bearing and are asserted in the tests:
 //!
@@ -82,10 +82,7 @@
 //!   anything this fold did not create. [`integrity_errors`] checks exactly
 //!   that and every fold test runs it.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-
-use prost_types::Value;
-use prost_types::value::Kind;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::proto::document::v1 as doc;
 use crate::proto::v1 as pb;
@@ -380,36 +377,11 @@ impl DocumentFold {
             footer_bytes: Some(u64::from(info.footer_size)),
             prefix_bytes: Some(u64::from(info.prefix_size)),
             rows_truncated: None,
-            ..doc::RecordLayoutMeta::default()
+            schema_name: None,
+            selector: None,
+            rows: None,
+            layout_source: record_layout_source(info.source) as i32,
         };
-
-        // Four of the body's five keys now have that typed home and are the
-        // duplicates kept for one release; `ebcdic.layout_source` remains the
-        // duplicate it always was of `CollectorSource.model`. See
-        // `table_custom_fields` for the window this repo is in.
-        let mut custom_fields = HashMap::new();
-        custom_fields.insert("ebcdic.encoding".to_string(), string_value(&info.encoding));
-        if let Some(source) = self.model.clone() {
-            custom_fields.insert("ebcdic.layout_source".to_string(), string_value(&source));
-        }
-        custom_fields.insert(
-            "ebcdic.header_size".to_string(),
-            number_value(u64::from(info.header_size)),
-        );
-        custom_fields.insert(
-            "ebcdic.footer_size".to_string(),
-            number_value(u64::from(info.footer_size)),
-        );
-        custom_fields.insert(
-            "ebcdic.prefix_size".to_string(),
-            number_value(u64::from(info.prefix_size)),
-        );
-        if let Some(body) = self.document.body.as_mut() {
-            body.meta = Some(doc::BaseMeta {
-                custom_fields,
-                ..Default::default()
-            });
-        }
 
         for schema in &info.records {
             // Fillers are not columns: they name nothing and decode to
@@ -567,7 +539,6 @@ impl DocumentFold {
     /// facts that are only knowable now the rows are all in.
     fn add_table(&mut self, mut state: TableState) {
         let self_ref = format!("#/tables/{}", self.document.tables.len());
-        let custom_fields = table_custom_fields(&state);
         // The layout this table was decoded with, typed: the parse-wide code
         // page and byte trims, this schema's own record length, and the count
         // of what the row cap dropped. The count is always set, because zero
@@ -575,6 +546,12 @@ impl DocumentFold {
         let record_layout = doc::RecordLayoutMeta {
             record_length: Some(u64::from(state.record_length)),
             rows_truncated: Some(state.dropped),
+            // The copybook record's name, which a single-schema document has
+            // no heading to carry, and the selector its records matched.
+            schema_name: Some(state.name.clone()),
+            selector: state.selector.clone(),
+            // Every record the schema matched, the ones past the cap included.
+            rows: Some(state.rows + state.dropped),
             ..self.layout.clone()
         };
         let header: Vec<doc::TableCell> = state
@@ -616,10 +593,9 @@ impl DocumentFold {
             // interleaved with every other schema's in the input, so a table
             // spans no single range of bytes. Its rows do, and each one says
             // so in `data.row_prov`.
-            meta: Some(doc::FloatingMeta {
-                custom_fields,
-                ..Default::default()
-            }),
+            // No meta: every fact about the table is typed, in
+            // `data.record_layout` and `data.columns`.
+            meta: None,
             data: Some(doc::TableData {
                 // The header row is a row of the grid, so the count includes it.
                 num_rows: clamp(state.rows.saturating_add(1)),
@@ -665,54 +641,6 @@ impl DocumentFold {
             })),
         }
     }
-}
-
-/// The custom fields of one schema's table.
-///
-/// `ebcdic.schema` is the one field upstream has no equivalent of: a schema is
-/// named only through the heading emitted when there is more than one, so a
-/// single-schema document loses the name altogether. Naming it here costs
-/// nothing and keeps every table self-describing.
-///
-/// Where the extended schema has grown a home, that home is now the truth and
-/// the key is a duplicate kept for one release so that no reader breaks on the
-/// same day the fold starts filling it in:
-///
-/// - `ebcdic.rows` duplicates `TableData.num_rows` less the header row.
-/// - `ebcdic.record_length` duplicates `record_layout.record_length`, and
-///   `ebcdic.rows_truncated` duplicates `record_layout.rows_truncated`. The
-///   typed count is always set and reads zero for a complete table; the custom
-///   field is written only when rows were dropped, which is what it has always
-///   done.
-/// - on the body, `ebcdic.encoding`, `ebcdic.header_size`,
-///   `ebcdic.footer_size` and `ebcdic.prefix_size` duplicate
-///   `record_layout.encoding`, `.header_bytes`, `.footer_bytes` and
-///   `.prefix_bytes` on every table.
-/// - the per-column facts these keys used to stand in for - the field type,
-///   the picture, the byte offset and width, the level, the path - are now
-///   `TableData.columns`, and the per-row byte offsets are
-///   `TableData.row_prov`.
-///
-/// `ebcdic.schema` and `ebcdic.selector` have no first-class home in the
-/// extended schema, so they stay custom fields rather than being dropped.
-fn table_custom_fields(state: &TableState) -> HashMap<String, Value> {
-    let mut custom_fields = HashMap::new();
-    custom_fields.insert("ebcdic.schema".to_string(), string_value(&state.name));
-    custom_fields.insert(
-        "ebcdic.record_length".to_string(),
-        number_value(u64::from(state.record_length)),
-    );
-    if let Some(selector) = state.selector.as_ref() {
-        custom_fields.insert("ebcdic.selector".to_string(), string_value(selector));
-    }
-    custom_fields.insert("ebcdic.rows".to_string(), number_value(state.rows));
-    if state.dropped > 0 {
-        custom_fields.insert(
-            "ebcdic.rows_truncated".to_string(),
-            number_value(state.dropped),
-        );
-    }
-    custom_fields
 }
 
 /// One column of a folded table, from the field schema behind it.
@@ -893,6 +821,16 @@ fn ref_item(reference: &str) -> doc::RefItem {
     }
 }
 
+/// The Document plane's name for the form the layout arrived in.
+fn record_layout_source(source: i32) -> doc::RecordLayoutSource {
+    match pb::LayoutSource::try_from(source) {
+        Ok(pb::LayoutSource::Proto) => doc::RecordLayoutSource::Layout,
+        Ok(pb::LayoutSource::Json) => doc::RecordLayoutSource::DoclingJson,
+        Ok(pb::LayoutSource::Copybook) => doc::RecordLayoutSource::Copybook,
+        Ok(pb::LayoutSource::Unspecified) | Err(_) => doc::RecordLayoutSource::Unspecified,
+    }
+}
+
 /// The lowercase name of a layout form, or `None` when the server did not say.
 fn layout_source_name(source: i32) -> Option<&'static str> {
     match pb::LayoutSource::try_from(source) {
@@ -900,24 +838,6 @@ fn layout_source_name(source: i32) -> Option<&'static str> {
         Ok(pb::LayoutSource::Json) => Some("json"),
         Ok(pb::LayoutSource::Copybook) => Some("copybook"),
         Ok(pb::LayoutSource::Unspecified) | Err(_) => None,
-    }
-}
-
-/// A `google.protobuf.Value` holding a string.
-fn string_value(text: &str) -> Value {
-    Value {
-        kind: Some(Kind::StringValue(text.to_string())),
-    }
-}
-
-/// A `google.protobuf.Value` holding a count.
-///
-/// `Value` is a double, which holds every integer below 2^53 exactly; every
-/// count written here is a byte width or a row count under the fold cap.
-#[allow(clippy::cast_precision_loss)]
-fn number_value(number: u64) -> Value {
-    Value {
-        kind: Some(Kind::NumberValue(number as f64)),
     }
 }
 
@@ -1290,25 +1210,15 @@ mod tests {
         collector.clone()
     }
 
-    /// A custom field, as a string.
-    fn custom_string(
-        fields: &std::collections::HashMap<String, prost_types::Value>,
-        key: &str,
-    ) -> String {
-        match fields.get(key).and_then(|value| value.kind.as_ref()) {
-            Some(prost_types::value::Kind::StringValue(text)) => text.clone(),
-            other => panic!("{key} is {other:?}, not a string"),
-        }
-    }
-
-    /// A custom field, as a number.
-    fn custom_number(
-        fields: &std::collections::HashMap<String, prost_types::Value>,
-        key: &str,
-    ) -> f64 {
-        match fields.get(key).and_then(|value| value.kind.as_ref()) {
-            Some(prost_types::value::Kind::NumberValue(number)) => *number,
-            other => panic!("{key} is {other:?}, not a number"),
+    /// Assert an item's meta carries no `custom_fields` bag: every fact this
+    /// fold knows has a typed home.
+    fn no_bag(fields: Option<&std::collections::HashMap<String, prost_types::Value>>) {
+        if let Some(fields) = fields {
+            assert_eq!(
+                fields.keys().collect::<Vec<_>>(),
+                Vec::<&String>::new(),
+                "no stringly keyed facts"
+            );
         }
     }
 
@@ -1380,8 +1290,7 @@ mod tests {
                 "#/body",
                 "a table is the heading's sibling, not its child"
             );
-            let fields = &table.meta.as_ref().unwrap().custom_fields;
-            assert_eq!(custom_string(fields, "ebcdic.schema"), *name);
+            assert_eq!(record_layout(table).schema_name.as_deref(), Some(*name));
         }
 
         // The filler is not a column: it has no name and no cell.
@@ -1700,9 +1609,10 @@ mod tests {
             collector(&document.tables[0].source).model.as_deref(),
             Some("copybook")
         );
-        let body = document.body.as_ref().unwrap();
-        let fields = &body.meta.as_ref().unwrap().custom_fields;
-        assert_eq!(custom_string(fields, "ebcdic.layout_source"), "copybook");
+        assert_eq!(
+            record_layout(&document.tables[0]).layout_source,
+            doc::RecordLayoutSource::Copybook as i32
+        );
     }
 
     #[test]
@@ -1735,8 +1645,10 @@ mod tests {
             vec!["#/tables/0"]
         );
         // The name docling would have lost with the heading.
-        let fields = &document.tables[0].meta.as_ref().unwrap().custom_fields;
-        assert_eq!(custom_string(fields, "ebcdic.schema"), "R");
+        assert_eq!(
+            record_layout(&document.tables[0]).schema_name.as_deref(),
+            Some("R")
+        );
     }
 
     #[test]
@@ -1783,8 +1695,10 @@ mod tests {
             1,
             "an empty schema is not an empty table"
         );
-        let fields = &document.tables[0].meta.as_ref().unwrap().custom_fields;
-        assert_eq!(custom_string(fields, "ebcdic.schema"), "CUSTOMER");
+        assert_eq!(
+            record_layout(&document.tables[0]).schema_name.as_deref(),
+            Some("CUSTOMER")
+        );
         // The heading survives the pruning: the layout still declared two
         // schemas, so the one table that is here says which one it is.
         assert_eq!(
@@ -1805,7 +1719,7 @@ mod tests {
     }
 
     #[test]
-    fn the_body_and_the_tables_carry_the_layout_facts_as_custom_fields() {
+    fn the_layout_facts_are_typed_and_no_custom_field_bag_carries_them() {
         let mut layout = two_schema_layout();
         layout.header_size = 3;
         layout.footer_size = 5;
@@ -1814,20 +1728,27 @@ mod tests {
         data.extend(b"TRAIL");
         let document = fold(&options(layout), &data, DocumentFold::new(VERSION));
 
-        let body = document.body.as_ref().unwrap();
-        let fields = &body.meta.as_ref().unwrap().custom_fields;
-        assert_eq!(custom_string(fields, "ebcdic.encoding"), "cp037");
-        assert_eq!(custom_string(fields, "ebcdic.layout_source"), "proto");
-        assert!((custom_number(fields, "ebcdic.header_size") - 3.0).abs() < f64::EPSILON);
-        assert!((custom_number(fields, "ebcdic.footer_size") - 5.0).abs() < f64::EPSILON);
-        assert!((custom_number(fields, "ebcdic.prefix_size") - 1.0).abs() < f64::EPSILON);
-
-        let fields = &document.tables[0].meta.as_ref().unwrap().custom_fields;
-        assert_eq!(custom_string(fields, "ebcdic.schema"), "CUSTOMER");
-        assert_eq!(custom_string(fields, "ebcdic.selector"), "C");
-        assert!((custom_number(fields, "ebcdic.record_length") - 9.0).abs() < f64::EPSILON);
-        assert!((custom_number(fields, "ebcdic.rows") - 1.0).abs() < f64::EPSILON);
-        assert!(!fields.contains_key("ebcdic.rows_truncated"));
+        no_bag(
+            document
+                .body
+                .as_ref()
+                .unwrap()
+                .meta
+                .as_ref()
+                .map(|meta| &meta.custom_fields),
+        );
+        let table = &document.tables[0];
+        no_bag(table.meta.as_ref().map(|meta| &meta.custom_fields));
+        let declared = record_layout(table);
+        assert_eq!(declared.schema_name.as_deref(), Some("CUSTOMER"));
+        assert_eq!(declared.selector.as_deref(), Some("C"));
+        assert_eq!(declared.rows, Some(1));
+        assert_eq!(
+            declared.layout_source,
+            doc::RecordLayoutSource::Layout as i32
+        );
+        assert_eq!(declared.encoding.as_deref(), Some("cp037"));
+        assert_eq!(declared.header_bytes, Some(3));
     }
 
     #[test]
@@ -1878,52 +1799,6 @@ mod tests {
         // the file boundaries, and it is what stands between the record extent
         // in `row_prov` and the byte offsets the columns declare.
         assert_eq!(declared.prefix_bytes, Some(1));
-    }
-
-    #[test]
-    fn the_deprecated_layout_custom_fields_are_still_emitted_beside_the_typed_ones() {
-        let mut layout = two_schema_layout();
-        layout.header_size = 3;
-        layout.footer_size = 5;
-        let mut data = b"HDR".to_vec();
-        data.extend(customer("JANE", [0x12, 0x34, 0x5d]));
-        data.extend(b"TRAIL");
-        let document = fold(&options(layout), &data, DocumentFold::new(VERSION));
-
-        // The deprecation window: both halves are written this release, and
-        // they agree. Delete either half and this fails, which is how the
-        // window ends deliberately rather than by accident.
-        let body = document.body.as_ref().unwrap();
-        let fields = &body.meta.as_ref().unwrap().custom_fields;
-        let table = &document.tables[0];
-        let declared = record_layout(table);
-        assert_eq!(
-            custom_string(fields, "ebcdic.encoding"),
-            declared.encoding.clone().unwrap()
-        );
-        assert!(
-            (custom_number(fields, "ebcdic.header_size") - 3.0).abs() < f64::EPSILON
-                && declared.header_bytes == Some(3)
-        );
-        assert!(
-            (custom_number(fields, "ebcdic.footer_size") - 5.0).abs() < f64::EPSILON
-                && declared.footer_bytes == Some(5)
-        );
-        assert!(
-            (custom_number(fields, "ebcdic.prefix_size") - 1.0).abs() < f64::EPSILON
-                && declared.prefix_bytes == Some(1)
-        );
-
-        let fields = &table.meta.as_ref().unwrap().custom_fields;
-        assert!(
-            (custom_number(fields, "ebcdic.record_length") - 9.0).abs() < f64::EPSILON
-                && declared.record_length == Some(9)
-        );
-        // These two never had a typed home and are not deprecated with the
-        // rest: a schema name and a record selector are this collector's, not
-        // the document schema's.
-        assert_eq!(custom_string(fields, "ebcdic.schema"), "CUSTOMER");
-        assert_eq!(custom_string(fields, "ebcdic.selector"), "C");
     }
 
     #[test]
@@ -2157,16 +2032,10 @@ mod tests {
         assert_eq!(row_span(table, 2), Some((10, 20)));
         // The typed count is the truth: two rows dropped, as a number.
         assert_eq!(record_layout(table).rows_truncated, Some(2));
-        let fields = &table.meta.as_ref().unwrap().custom_fields;
-        assert!((custom_number(fields, "ebcdic.rows") - 2.0).abs() < f64::EPSILON);
-        // Still written beside it for one release, and still only when rows
-        // were actually dropped, which is what this key has always meant.
-        assert!((custom_number(fields, "ebcdic.rows_truncated") - 2.0).abs() < f64::EPSILON);
-        // The other schema is under the cap. The typed count says so with a
-        // zero; the custom field says so by being absent.
+        // Every record the schema matched, kept or not.
+        assert_eq!(record_layout(table).rows, Some(4));
+        // The other schema is under the cap, and zero says so.
         assert_eq!(record_layout(&document.tables[1]).rows_truncated, Some(0));
-        let fields = &document.tables[1].meta.as_ref().unwrap().custom_fields;
-        assert!(!fields.contains_key("ebcdic.rows_truncated"));
         assert_eq!(row_text(&document.tables[1], 1), vec!["7"]);
     }
 
